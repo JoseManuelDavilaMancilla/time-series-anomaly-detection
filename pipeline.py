@@ -1,10 +1,10 @@
 """
-author v44 — W_SHIFT=0.20: same as v43 but less P2 influence.
+author v45 — W_SHIFT=0.40: same as v43 but more P2 influence.
 
-Hypothesis: if P2 is noisy, reducing its weight 0.30→0.20 improves LB.
-v43 baseline: 0.6561 LB (W_SHIFT=0.30).
+Hypothesis: if P2 captures genuine shift signal, increasing its weight 0.30→0.40
+improves LB. v43 baseline: 0.6561 LB (W_SHIFT=0.30).
 
-Run:  uv run python v44_wshift20.py
+Run:  uv run python v45_wshift40.py
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ METRIC_TYPES = ("Count", "ErrorCount", "LatencySecond", "QPS",
 TOP_K_SERVICES = 30
 SMOOTH_W = 5
 SMOOTH_ALPHA = 0.8
-W_SHIFT = 0.20          # blend weight for P2 shift model
+W_SHIFT = 0.40          # blend weight for P2 shift model
 SPLIT_FRAC = 0.70       # fraction of train_x used as "reference" for P2 training
 N_FEATS_P1 = 68
 N_FEATS_P2 = 75         # 68 + 7 shift features
@@ -484,10 +484,10 @@ def run_validation(seed: int = 42):
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v44 W_SHIFT=0.20 (CW-LOO)")
+    print_summary_v2(rep, "v45 W_SHIFT=0.40 (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v44_wshift20_loo")
+    save_report(rep, "v45_wshift40_loo")
     return rep, ensembles, top_services
 
 
@@ -526,4 +526,4 @@ if __name__ == "__main__":
     ensembles_full = fit_both_ensembles(all_window_dirs(), top_services_full)
     print(f"    full fit {time.time() - t0:.1f}s")
     generate_submission(ensembles_full, top_services_full,
-                        output=Path("submission_v44_wshift20.json"))
+                        output=Path("submission_v45_wshift40.json"))
