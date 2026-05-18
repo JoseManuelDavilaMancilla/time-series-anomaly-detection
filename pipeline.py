@@ -101,7 +101,7 @@ N_FEATS_P1      = 77 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_F
 N_FEATS_P2      = 84 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_FFT_BROAD + N_STL_AR_FEATS + N_CATCH22_FEATS + N_COMPLEX_FEATS + N_PMRULE_FEATS  # 146
 PSEUDO_WEIGHT   = 0.70
 PSEUDO_SOURCE   = Path("submission_v68_stl_ar.json")
-CACHE_DIR       = Path("../tda_cache")
+CACHE_DIR       = Path("tda_cache")
 MP_WINDOWS      = [5, 10, 20]
 EXTRA_ROLL_W    = [3, 7, 63]
 
