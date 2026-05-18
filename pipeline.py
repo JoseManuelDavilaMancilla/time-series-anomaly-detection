@@ -1,21 +1,28 @@
 """
-author v16 — 3-seed long-context CNN ensemble (context=64 instead of 32).
+author v17 — Stacking meta-classifier on channel scores.
 
-v7's 3-seed CNN ensemble used 32-point context and was +0.011 over single-seed.
-v10 tested CNN_Long (context=64) as a *single-seed* model and lost as part of a
-mixed-architecture ensemble. We never tested 3-seed of just CNN_Long.
+The current pipeline blends channels (cw, cnn, pw, if, online, global_distance)
+with hardcoded weights per category: e.g. partial_overlap = 0.35 cw + 0.35 pw +
+(0.30 - CNN_WEIGHT) local + CNN_WEIGHT cnn. These weights were chosen by ablation,
+not learned.
 
-Hypothesis: longer context (64 vs 32) lets the CNN see longer temporal patterns
-(seasonality, ramps over 30-60 samples). The CNN_Long architecture from
-`v10_cnn_diverse.py` has kernel sizes (5, 9, 15) tuned for that range.
-Three seeds of CNN_Long, predictions averaged, should match or beat the short-
-context 3-seed ensemble. If it does, it's a broad architectural change (every
-window gets a different score) — the kind that transfers well on the LB per
-today's calibration lessons.
+Hypothesis: a logistic regression trained on holdout-window scores (with the
+true labels as target) will find better blending weights than our hand-tuned
+constants. Per-category models can capture different optimal weights for each
+window category.
 
-Stacks on top of v11 all_v12 (which is at 0.6238 LB).
+Procedure:
+  1. Train the full model stack (RF hybrid + 3 CNNs + 5 LGBM for QPS).
+  2. On the holdout (100 windows), compute all channel scores per point.
+  3. Train 4 LogisticRegression meta-classifiers, one per category, using true
+     labels as target. Use L2 regularization to avoid overfitting.
+  4. At inference, use the appropriate meta-classifier per category.
 
-Run:  uv run python v16_long_context_cnn.py
+Risk: meta-classifiers overfit to the 100-window holdout. Mitigation: very
+strong L2 regularization, plus train each meta-classifier on cross-validation
+splits of the holdout to ensure it sees both label patterns.
+
+Run:  uv run python v17_stacking.py
 """
 
 from __future__ import annotations
@@ -24,17 +31,16 @@ import json
 import time
 import warnings
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
+warnings.filterwarnings("ignore", category=UserWarning)
 
 from shared_lib import (
+    CrossWindowModel,
     HybridCrossWindowModel,
     categorize_window,
     global_distance_score,
@@ -44,120 +50,24 @@ from shared_lib import (
     per_window_rf_score,
     predict_segments,
 )
-from v6_cnn import (
-    DEVICE, EPOCHS, BATCH, LR, WEIGHT_POS, SUBSAMPLE_NEG, SEED, SPECIALIZED,
-    _zscore_series,
-)
-from v7_cnn_ensemble import build_hybrid, CNN_SEEDS
-from v10_cnn_diverse import CNN_Long, build_contexts as long_contexts
+from v6_cnn import build_training_pool as v6_pool, SPECIALIZED
+from v7_cnn_ensemble import CNN_SEEDS, ensemble_cnn_score, fit_cnn_with_seed
 from validation import (
     all_window_dirs,
     evaluate,
     load_window,
+    point_f1,
     print_summary,
     save_report,
     stratified_holdout,
+    time_split,
 )
 
 SEG_KWARGS = dict(smooth=3, thr_frac=0.7, small_k_cutoff=4, max_seg=60)
-CNN_WEIGHT = 0.35
-CONTEXT = 64  # long context
-
-
-def build_long_training_pool(window_dirs) -> tuple[np.ndarray, np.ndarray]:
-    """v6_pool but at CONTEXT=64."""
-    Xs, ys = [], []
-    for wdir in window_dirs:
-        train_y = np.load(wdir / "train_label.npy")
-        if train_y.sum() == 0:
-            continue
-        train_x = np.load(wdir / "train.npy")
-        if len(train_x) < CONTEXT // 2 + 4:
-            continue
-        Xs.append(long_contexts(train_x, CONTEXT))
-        ys.append(train_y.astype(np.float32))
-    X = np.vstack(Xs)
-    y = np.concatenate(ys)
-    if 0 < SUBSAMPLE_NEG < 1.0:
-        rng = np.random.default_rng(SEED)
-        neg_idx = np.where(y == 0)[0]
-        keep_n = int(len(neg_idx) * SUBSAMPLE_NEG)
-        keep_idx = rng.choice(neg_idx, size=keep_n, replace=False)
-        all_idx = np.concatenate([np.where(y == 1)[0], keep_idx])
-        rng.shuffle(all_idx)
-        X = X[all_idx]
-        y = y[all_idx]
-    return X, y
-
-
-def fit_long_cnn(X: np.ndarray, y: np.ndarray, seed: int = 42) -> nn.Module:
-    """Train CNN_Long (context=64) with the given seed."""
-    import sys
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    model = CNN_Long().to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
-    pos_weight = torch.tensor([WEIGHT_POS], dtype=torch.float32, device=DEVICE)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-    ds = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
-    dl = DataLoader(ds, batch_size=BATCH, shuffle=True, num_workers=0)
-
-    for epoch in range(EPOCHS):
-        model.train()
-        running, n_batches = 0.0, 0
-        t0 = time.time()
-        for xb, yb in dl:
-            xb = xb.to(DEVICE); yb = yb.to(DEVICE)
-            opt.zero_grad()
-            loss = loss_fn(model(xb), yb)
-            loss.backward(); opt.step()
-            running += loss.item(); n_batches += 1
-        print(f"      epoch {epoch + 1}/{EPOCHS}  loss={running / n_batches:.4f}  "
-              f"({time.time() - t0:.1f}s)", flush=True)
-        sys.stdout.flush()
-    return model
-
-
-def long_cnn_score(model: nn.Module, test_x: np.ndarray) -> np.ndarray:
-    model.eval()
-    X = long_contexts(test_x, CONTEXT)
-    with torch.no_grad():
-        logits = model(torch.from_numpy(X).to(DEVICE))
-        proba = torch.sigmoid(logits).cpu().numpy()
-    return proba
-
-
-def long_ensemble_score(models: List, test_x: np.ndarray) -> np.ndarray:
-    return np.mean([long_cnn_score(m, test_x) for m in models], axis=0)
-
-
-def scores_v11(train_x, train_y, test_x, cw, cnn_models, metric_type,
-               cnn_score_fn) -> np.ndarray:
-    """v11 all_v12 ensemble template parameterized by the CNN score function."""
-    category = categorize_window(train_x, test_x)
-    cw_s = normalize_scores(cw.predict_proba(test_x, metric_type=metric_type))
-    cnn_s = normalize_scores(cnn_score_fn(cnn_models, test_x))
-
-    if category == "constant_train":
-        if_s = normalize_scores(isolation_forest_test(test_x, train_y))
-        return (0.50 - CNN_WEIGHT) * cw_s + 0.50 * if_s + CNN_WEIGHT * cnn_s
-    if category == "disjoint":
-        g_s = normalize_scores(global_distance_score(train_x, test_x))
-        if_s = normalize_scores(isolation_forest_test(test_x, train_y))
-        return 0.35 * cw_s + 0.30 * g_s + (0.35 - CNN_WEIGHT) * if_s + CNN_WEIGHT * cnn_s
-    if category == "partial_overlap":
-        pw = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
-        local = normalize_scores(online_ensemble(test_x, window=15))
-        return 0.35 * cw_s + 0.35 * pw + (0.30 - CNN_WEIGHT) * local + CNN_WEIGHT * cnn_s
-    if category == "test_within_train":
-        pw = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
-        return (0.50 - CNN_WEIGHT) * cw_s + 0.50 * pw + CNN_WEIGHT * cnn_s
-    return np.zeros(len(test_x))
+CATEGORIES = ("constant_train", "disjoint", "partial_overlap", "test_within_train")
 
 
 def build_rf_hybrid(window_dirs):
-    from shared_lib import CrossWindowModel
     g = CrossWindowModel(backend="rf", per_metric=False,
                          n_estimators=500, max_depth=15).fit(window_dirs)
     p = CrossWindowModel(backend="rf", per_metric=True,
@@ -166,10 +76,83 @@ def build_rf_hybrid(window_dirs):
                                   specialized_types=SPECIALIZED)
 
 
-def run_validation(seed: int = 42) -> dict:
-    from v6_cnn import build_training_pool as short_pool
-    from v7_cnn_ensemble import fit_cnn_with_seed, ensemble_cnn_score
+def compute_channels(train_x, train_y, test_x, cw, cnn_models,
+                     metric_type) -> Dict[str, np.ndarray]:
+    """Return a dict of all normalized channel scores for the test window."""
+    n = len(test_x)
+    chans = {
+        "cw":   normalize_scores(cw.predict_proba(test_x, metric_type=metric_type)),
+        "cnn":  normalize_scores(ensemble_cnn_score(cnn_models, test_x)),
+        "if":   normalize_scores(isolation_forest_test(test_x, train_y)),
+        "g":    normalize_scores(global_distance_score(train_x, test_x)),
+        "local": normalize_scores(online_ensemble(test_x, window=15)),
+    }
+    if train_y.sum() > 0:
+        chans["pw"] = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
+    else:
+        chans["pw"] = np.zeros(n)
+    return chans
 
+
+def channels_to_features(chans: Dict[str, np.ndarray], category: str) -> np.ndarray:
+    """Build a (n_points, n_features) array for the meta-classifier."""
+    keys = ["cw", "cnn", "if", "g", "local", "pw"]
+    X = np.column_stack([chans[k] for k in keys])
+    return X
+
+
+def baseline_blend(chans: Dict[str, np.ndarray], category: str) -> np.ndarray:
+    """The current hand-tuned v11 all_v12 blend, for comparison."""
+    cw, cnn, if_, g, local, pw = (chans[k] for k in ["cw", "cnn", "if", "g", "local", "pw"])
+    CNN_WEIGHT = 0.35
+    if category == "constant_train":
+        return (0.50 - CNN_WEIGHT) * cw + 0.50 * if_ + CNN_WEIGHT * cnn
+    if category == "disjoint":
+        return 0.35 * cw + 0.30 * g + (0.35 - CNN_WEIGHT) * if_ + CNN_WEIGHT * cnn
+    if category == "partial_overlap":
+        return 0.35 * cw + 0.35 * pw + (0.30 - CNN_WEIGHT) * local + CNN_WEIGHT * cnn
+    if category == "test_within_train":
+        return (0.50 - CNN_WEIGHT) * cw + 0.50 * pw + CNN_WEIGHT * cnn
+    return np.zeros_like(cw)
+
+
+def fit_stackers(channel_data: List[dict]):
+    """Train one LogisticRegression per category on cached holdout channels.
+
+    `channel_data` is a list of dicts with keys: category, chans, y_true."""
+    from sklearn.linear_model import LogisticRegression
+
+    stackers = {}
+    for cat in CATEGORIES:
+        rows = [r for r in channel_data if r["category"] == cat]
+        if not rows:
+            print(f"  {cat}: no holdout windows; using None (will fall back to baseline blend)")
+            stackers[cat] = None
+            continue
+        Xs = np.vstack([channels_to_features(r["chans"], cat) for r in rows])
+        ys = np.concatenate([r["y_true"].astype(int) for r in rows])
+        if ys.sum() < 5 or (ys == 0).sum() < 5:
+            print(f"  {cat}: too few labels (pos={ys.sum()}, neg={(ys == 0).sum()}); fallback")
+            stackers[cat] = None
+            continue
+        clf = LogisticRegression(C=0.5, max_iter=1000, class_weight="balanced")
+        clf.fit(Xs, ys)
+        stackers[cat] = clf
+        coefs = dict(zip(["cw", "cnn", "if", "g", "local", "pw"], clf.coef_[0]))
+        print(f"  {cat}: trained on {len(rows)} windows, pos_rate={ys.mean():.3f}, coefs={coefs}")
+    return stackers
+
+
+def stacker_blend(chans, category, stackers):
+    clf = stackers.get(category)
+    if clf is None:
+        return baseline_blend(chans, category)
+    X = channels_to_features(chans, category)
+    proba = clf.predict_proba(X)
+    return proba[:, 1] if proba.shape[1] > 1 else np.zeros(X.shape[0])
+
+
+def run_validation(seed: int = 42) -> dict:
     print("\n>>> Building stratified holdout (10%)…")
     train_pool, holdout = stratified_holdout(all_window_dirs(), frac=0.10, seed=seed)
     print(f"    train_pool={len(train_pool)}  holdout={len(holdout)}")
@@ -179,68 +162,111 @@ def run_validation(seed: int = 42) -> dict:
     rf_hybrid = build_rf_hybrid(train_pool)
     print(f"    fit {time.time() - t0:.1f}s")
 
-    # Short-context (32) ensemble — baseline (v11 current best)
-    print(">>> Training short-context 3-seed CNN ensemble (context=32) — baseline…")
-    Xs, ys = short_pool(train_pool)
-    short_models = []
+    print(">>> Training 3-seed CNN ensemble…")
+    Xc, yc = v6_pool(train_pool)
+    cnn_models = []
     for s in CNN_SEEDS:
         t0 = time.time()
-        short_models.append(fit_cnn_with_seed(Xs, ys, s))
-        print(f"    short cnn seed={s} fit {time.time() - t0:.1f}s")
+        cnn_models.append(fit_cnn_with_seed(Xc, yc, s))
+        print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
 
-    # Long-context (64) ensemble — new variant
-    print(">>> Training long-context 3-seed CNN ensemble (context=64)…")
-    Xl, yl = build_long_training_pool(train_pool)
-    print(f"    long pool X={Xl.shape}")
-    long_models = []
-    for s in CNN_SEEDS:
-        t0 = time.time()
-        long_models.append(fit_long_cnn(Xl, yl, seed=s))
-        print(f"    long cnn seed={s} fit {time.time() - t0:.1f}s")
+    # Two-fold cross-validation on the holdout:
+    # - fold A: train stackers on first 50 windows, eval on last 50
+    # - fold B: vice versa
+    # Reports the mean of both folds as the unbiased validation F1.
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(len(holdout))
+    fold_a = [holdout[i] for i in idx[:50]]
+    fold_b = [holdout[i] for i in idx[50:]]
 
-    def predictor(cnn_models, cnn_fn):
-        def pred(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
-            scores = scores_v11(sub_tr_x, sub_tr_y, sub_te_x, rf_hybrid, cnn_models,
-                                info.get("metric_type", "ALL"), cnn_fn)
-            return predict_segments(scores, int(round(len(sub_te_x) * ratio)), **SEG_KWARGS)
-        return pred
+    print("\n>>> Caching channels for both folds…")
+    t0 = time.time()
+    cache = {}
+    for w_dirs, fold_name in [(fold_a, "A"), (fold_b, "B")]:
+        cache[fold_name] = []
+        for wdir in w_dirs:
+            w = load_window(wdir)
+            sub_tr_x, sub_tr_y, sub_te_x, sub_te_y = time_split(w.train_x, w.train_y, frac=0.70)
+            ratio = float(sub_te_y.mean()) if len(sub_te_y) else 0.0
+            cat = categorize_window(sub_tr_x, sub_te_x)
+            chans = compute_channels(sub_tr_x, sub_tr_y, sub_te_x, rf_hybrid, cnn_models,
+                                     w.metric_type)
+            cache[fold_name].append({
+                "wid": w.wid, "category": cat,
+                "chans": chans, "y_true": sub_te_y, "ratio": ratio, "n": len(sub_te_x),
+            })
+    print(f"    cache built in {time.time() - t0:.1f}s")
 
-    print("\n>>> Eval: short-context 3-seed CNN (v11 baseline)…")
-    rep_short = evaluate(predictor(short_models, ensemble_cnn_score), holdout)
-    print_summary(rep_short, name="short-context CNN")
+    print("\n>>> Eval BASELINE blend (hand-tuned weights)…")
+    baseline_f1s = []
+    for fold_name in ["A", "B"]:
+        for r in cache[fold_name]:
+            scores = baseline_blend(r["chans"], r["category"])
+            k = int(round(r["n"] * r["ratio"]))
+            pred = predict_segments(scores, k, **SEG_KWARGS)
+            baseline_f1s.append(point_f1(r["y_true"], pred))
+    baseline_f1 = float(np.mean(baseline_f1s))
+    print(f"    baseline F1 = {baseline_f1:.4f}")
 
-    print(">>> Eval: long-context 3-seed CNN (v16)…")
-    rep_long = evaluate(predictor(long_models, long_ensemble_score), holdout)
-    print_summary(rep_long, name="long-context CNN")
+    print("\n>>> Train stackers on fold A, eval on fold B…")
+    stackers_A = fit_stackers(cache["A"])
+    f1s_b = []
+    for r in cache["B"]:
+        scores = stacker_blend(r["chans"], r["category"], stackers_A)
+        k = int(round(r["n"] * r["ratio"]))
+        pred = predict_segments(scores, k, **SEG_KWARGS)
+        f1s_b.append(point_f1(r["y_true"], pred))
+    f1_b = float(np.mean(f1s_b))
+    print(f"    fold B F1 = {f1_b:.4f}")
 
-    delta = rep_long["overall_f1"] - rep_short["overall_f1"]
-    print(f"\n  Δ (long − short) = {delta:+.4f}")
+    print("\n>>> Train stackers on fold B, eval on fold A…")
+    stackers_B = fit_stackers(cache["B"])
+    f1s_a = []
+    for r in cache["A"]:
+        scores = stacker_blend(r["chans"], r["category"], stackers_B)
+        k = int(round(r["n"] * r["ratio"]))
+        pred = predict_segments(scores, k, **SEG_KWARGS)
+        f1s_a.append(point_f1(r["y_true"], pred))
+    f1_a = float(np.mean(f1s_a))
+    print(f"    fold A F1 = {f1_a:.4f}")
+
+    stacker_f1 = (f1_a + f1_b) / 2
+    delta = stacker_f1 - baseline_f1
+    print(f"\n  Stacker mean F1 (held-out per fold) = {stacker_f1:.4f}")
+    print(f"  Baseline blend F1                   = {baseline_f1:.4f}")
+    print(f"  Δ (stacker − baseline) = {delta:+.4f}")
 
     report = {
-        "short_context": rep_short,
-        "long_context": rep_long,
-        "delta_long_vs_short": delta,
+        "baseline_f1": baseline_f1,
+        "stacker_fold_a_f1": f1_a,
+        "stacker_fold_b_f1": f1_b,
+        "stacker_mean_f1": stacker_f1,
+        "delta_stacker_vs_baseline": delta,
         "seed": seed,
         "n_holdout": len(holdout),
     }
-    save_report(report, "v16_long_context_cnn")
-    return report
+    save_report(report, "v17_stacking")
+    return report, rf_hybrid, cnn_models, cache
 
 
-def generate_submission(output: Path = Path("submission_long_context_cnn.json")) -> Path:
-    print("\n>>> Training RF hybrid on ALL 1000 windows…")
+def generate_submission(rf_hybrid, cnn_models, all_holdout_cache,
+                        output: Path = Path("submission_stacking.json")) -> Path:
+    """Train stackers on ALL holdout windows, generate test predictions."""
+    print("\n>>> Training stackers on FULL holdout (no cv splits)…")
+    full_data = all_holdout_cache["A"] + all_holdout_cache["B"]
+    stackers = fit_stackers(full_data)
+
+    print(">>> Re-training stack on ALL 1000 windows for inference models…")
     t0 = time.time()
-    rf_hybrid = build_rf_hybrid(all_window_dirs())
-    print(f"    fit {time.time() - t0:.1f}s")
+    rf_full = build_rf_hybrid(all_window_dirs())
+    print(f"    rf full fit {time.time() - t0:.1f}s")
 
-    print(">>> Training long-context 3-seed CNN ensemble on full data…")
-    Xl, yl = build_long_training_pool(all_window_dirs())
-    print(f"    long pool X={Xl.shape}")
-    long_models = []
+    Xc, yc = v6_pool(all_window_dirs())
+    cnn_full = []
     for s in CNN_SEEDS:
         t0 = time.time()
-        long_models.append(fit_long_cnn(Xl, yl, seed=s))
-        print(f"    long cnn seed={s} fit {time.time() - t0:.1f}s")
+        cnn_full.append(fit_cnn_with_seed(Xc, yc, s))
+        print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
 
     print(">>> Generating predictions…")
     preds: dict[str, list[int]] = {}
@@ -248,8 +274,10 @@ def generate_submission(output: Path = Path("submission_long_context_cnn.json"))
     for i, wdir in enumerate(all_window_dirs(), 1):
         w = load_window(wdir)
         test_ratio = float(w.info.get("test set anomaly ratio", 0.0))
-        scores = scores_v11(w.train_x, w.train_y, w.test_x, rf_hybrid, long_models,
-                            w.metric_type, long_ensemble_score)
+        cat = categorize_window(w.train_x, w.test_x)
+        chans = compute_channels(w.train_x, w.train_y, w.test_x, rf_full, cnn_full,
+                                 w.metric_type)
+        scores = stacker_blend(chans, cat, stackers)
         k = int(round(len(w.test_x) * test_ratio))
         preds[w.wid] = predict_segments(scores, k, **SEG_KWARGS).astype(int).tolist()
         if i % 100 == 0:
@@ -265,11 +293,11 @@ def generate_submission(output: Path = Path("submission_long_context_cnn.json"))
 
 
 if __name__ == "__main__":
-    rep = run_validation()
-    if rep["delta_long_vs_short"] > 0.003:
-        print(f"\nLong-context CNN beats short-context by {rep['delta_long_vs_short']:+.4f}; "
+    rep, rf, cnn, cache = run_validation()
+    if rep["delta_stacker_vs_baseline"] > 0.003:
+        print(f"\nStacker beats hand-tuned blend by {rep['delta_stacker_vs_baseline']:+.4f}; "
               "generating submission.")
-        generate_submission()
+        generate_submission(rf, cnn, cache)
     else:
-        print(f"\nLong-context CNN did not meaningfully beat short-context "
-              f"(Δ = {rep['delta_long_vs_short']:+.4f}); submission NOT generated.")
+        print(f"\nStacker did not meaningfully beat baseline "
+              f"(Δ = {rep['delta_stacker_vs_baseline']:+.4f}); submission NOT generated.")
