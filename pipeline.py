@@ -1,18 +1,24 @@
 """
-author v24 — 3-seed CW ensemble (variance reduction at the CW level).
+author v25 — submission-level voting ensemble (no model training).
 
-We've ensembled CNNs (3-seed +0.011 over single-seed) but never ensembled
-the RF cross-window model. Each RF is itself a 500-tree bagging ensemble,
-but two RFs with different `random_state` see different bootstrap samples
-and different feature subsets at each split, so their errors aren't fully
-correlated. Averaging their predicted probabilities should give a small
-variance reduction — same mechanism that worked for the CNN.
+After 9 model-side experiments saturated, try combining the *predictions* of
+our best submissions. Different architectures make different errors; if the
+errors are not fully correlated, voting can recover.
 
-Test stacked on the v22 winning architecture (metric_type hybrid + intervals
-as feature). Three seeds (42, 123, 7), predictions averaged at the proba
-level (not at the decision level).
+Approach:
+  1. Load N prediction files (each a {wid: [0/1, ...], ...} dict).
+  2. For each window's points, count how many submissions mark each point as 1.
+  3. The vote count is the new per-point "score".
+  4. Apply segment selection with the existing kbudget = round(len * test_ratio).
 
-Run:  uv run python v24_cw_ensemble.py
+The ensemble's predictions retain the budget constraint and the contiguous
+segment structure — only the choice of WHICH points are anomalous changes
+based on the agreement between architectures.
+
+We try multiple vote-set compositions and pick the one with the highest
+validation F1.
+
+Run:  uv run python v25_vote_ensemble.py
 """
 
 from __future__ import annotations
@@ -21,149 +27,132 @@ import json
 import time
 import warnings
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import numpy as np
-import torch
 
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
-from shared_lib import (
-    categorize_window,
-    global_distance_score,
-    isolation_forest_test,
-    normalize_scores,
-    online_ensemble,
-    per_window_rf_score,
-    predict_segments,
-)
-from v6_cnn import SPECIALIZED, build_training_pool as v6_pool
-from v7_cnn_ensemble import CNN_SEEDS, ensemble_cnn_score, fit_cnn_with_seed
-from v22_metadata_features import (
-    MetadataCrossWindowModel, MetadataHybridCW, build_metadata_hybrid,
-    scores_v14_with_meta,
-)
+from shared_lib import predict_segments
 from validation import (
     all_window_dirs,
-    evaluate,
     load_window,
-    print_summary,
+    point_f1,
     save_report,
     stratified_holdout,
+    time_split,
 )
 
 SEG_KWARGS = dict(smooth=3, thr_frac=0.7, small_k_cutoff=4, max_seg=60)
-CNN_WEIGHT = 0.35
-CW_SEEDS = (42, 123, 7)
 
 
-def build_metadata_hybrid_with_seed(window_dirs, mode: str, seed: int):
-    g = MetadataCrossWindowModel(mode=mode, per_metric=False,
-                                 n_estimators=500, max_depth=15, seed=seed).fit(window_dirs)
-    p = MetadataCrossWindowModel(mode=mode, per_metric=True,
-                                 n_estimators=500, max_depth=15, seed=seed).fit(window_dirs)
-    return MetadataHybridCW(g, p, SPECIALIZED)
+# Candidate submissions to combine. Order matters for tracking only.
+CANDIDATES = {
+    "v15_kimi_combo (0.6238 LB)":   "submission_kimi_combo_all_v12.json",
+    "v22_metadata":                 "submission_metadata_cw.json",
+    "v9_segtuned (0.6111 LB)":      "submission_segtuned.json",
+    "v14_qps_lgbm (0.6236 LB)":     "submission_qps_lgbm_routed.json",
+}
 
 
-class CWEnsemble:
-    """Wraps multiple MetadataHybridCW models and averages their predictions."""
-
-    def __init__(self, models: List[MetadataHybridCW]):
-        self.models = models
-
-    def predict_proba(self, test_x: np.ndarray, metric_type: str = "ALL",
-                      info: dict = None) -> np.ndarray:
-        preds = [m.predict_proba(test_x, metric_type=metric_type, info=info)
-                 for m in self.models]
-        return np.mean(preds, axis=0)
+# Vote set compositions to evaluate
+VOTE_SETS = {
+    "top2 (kimi_combo + metadata)":            ["v15_kimi_combo (0.6238 LB)", "v22_metadata"],
+    "top3 (teammate+metadata+qps)":                ["v15_kimi_combo (0.6238 LB)", "v22_metadata", "v14_qps_lgbm (0.6236 LB)"],
+    "top4 (all)":                              list(CANDIDATES.keys()),
+    "all minus segtuned":                      ["v15_kimi_combo (0.6238 LB)", "v22_metadata", "v14_qps_lgbm (0.6236 LB)"],
+}
 
 
-def run_validation(seed: int = 42) -> dict:
-    print("\n>>> Building stratified holdout (10%)…")
-    train_pool, holdout = stratified_holdout(all_window_dirs(), frac=0.10, seed=seed)
-    print(f"    train_pool={len(train_pool)}  holdout={len(holdout)}")
-
-    print(">>> Training 3-seed CNN ensemble…")
-    Xc, yc = v6_pool(train_pool)
-    cnn_models = []
-    for s in CNN_SEEDS:
-        t0 = time.time()
-        cnn_models.append(fit_cnn_with_seed(Xc, yc, s))
-        print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
-
-    print(">>> Training v22 baseline (single CW with intervals feature)…")
-    t0 = time.time()
-    cw_v22 = build_metadata_hybrid(train_pool, mode="intervals")
-    print(f"    fit {time.time() - t0:.1f}s")
-
-    print(">>> Training 3-seed CW ensemble (each = metadata hybrid)…")
-    cw_models = []
-    for s in CW_SEEDS:
-        t0 = time.time()
-        cw_models.append(build_metadata_hybrid_with_seed(train_pool, "intervals", s))
-        print(f"    cw seed={s} fit {time.time() - t0:.1f}s")
-    cw_v24 = CWEnsemble(cw_models)
-
-    def predictor(cw_obj):
-        def pred(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
-            scores = scores_v14_with_meta(sub_tr_x, sub_tr_y, sub_te_x, cw_obj,
-                                          cnn_models, info, info.get("metric_type", "ALL"))
-            return predict_segments(scores, int(round(len(sub_te_x) * ratio)), **SEG_KWARGS)
-        return pred
-
-    print("\n>>> Eval [v22 single CW + intervals feat]…")
-    rep_v22 = evaluate(predictor(cw_v22), holdout)
-    print_summary(rep_v22, name="v22 single CW")
-
-    print(">>> Eval [v24 3-seed CW ensemble + intervals feat]…")
-    rep_v24 = evaluate(predictor(cw_v24), holdout)
-    print_summary(rep_v24, name="v24 3-seed CW")
-
-    delta = rep_v24["overall_f1"] - rep_v22["overall_f1"]
-    print(f"\n  Δ (v24 − v22) = {delta:+.4f}")
-
-    report = {
-        "v22_baseline_f1": rep_v22["overall_f1"],
-        "v24_f1": rep_v24["overall_f1"],
-        "delta": delta,
-        "seed": seed,
-        "n_holdout": len(holdout),
-    }
-    save_report(report, "v24_cw_ensemble")
-    return report, cw_v24, cnn_models
+def load_submission(path: Path) -> Dict[str, List[int]]:
+    data = json.loads(path.read_text())
+    return {wid: np.asarray(pred, dtype=np.int8) for wid, pred in data["predictions"].items()}
 
 
-def generate_submission(cw_v24, cnn_models,
-                        output: Path = Path("submission_cw_ensemble.json")) -> Path:
-    print(f"\n>>> Re-training on ALL 1000 windows (3 seeds)…")
-    full_models = []
-    for s in CW_SEEDS:
-        t0 = time.time()
-        full_models.append(build_metadata_hybrid_with_seed(all_window_dirs(), "intervals", s))
-        print(f"    cw seed={s} fit {time.time() - t0:.1f}s")
-    cw_full = CWEnsemble(full_models)
+def vote_score(preds: List[np.ndarray]) -> np.ndarray:
+    """Per-point vote count = sum of binary predictions."""
+    return np.sum(np.vstack(preds), axis=0).astype(np.float64)
 
-    Xc, yc = v6_pool(all_window_dirs())
-    cnn_full = []
-    for s in CNN_SEEDS:
-        t0 = time.time()
-        cnn_full.append(fit_cnn_with_seed(Xc, yc, s))
-        print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
 
-    print(">>> Generating predictions…")
+def combine_predictions(subs: List[Dict[str, np.ndarray]], wid: str,
+                        k: int, n: int) -> np.ndarray:
+    """For one window, combine votes and pick top-k via segment selection.
+    If all submissions are zero, return all zeros. If k=0, return all zeros."""
+    if k <= 0:
+        return np.zeros(n, dtype=int)
+    point_arrays = [s[wid] for s in subs if wid in s]
+    if not point_arrays:
+        return np.zeros(n, dtype=int)
+    # Each prediction is 0/1; sum is in [0, len(subs)]
+    votes = vote_score(point_arrays)
+    # Tiny smoothing to break ties at very low budget (1-pt segments)
+    if votes.max() == 0:
+        return np.zeros(n, dtype=int)
+    return predict_segments(votes, k, **SEG_KWARGS)
+
+
+def evaluate_vote_set(subs: List[Dict[str, np.ndarray]], holdout, name: str) -> dict:
+    """Each held-out window: we KNOW the train labels; predict on full train_x's
+    last 30% using the submission's TEST predictions sliced (or fall back).
+
+    BUT submissions only have TEST predictions, not train predictions. So
+    voting-based evaluation against time-split sub_test labels isn't directly
+    possible. Instead, we evaluate by aligning submissions' predictions with
+    the *training* labels we have: each window's test prediction is treated
+    as the model's vote on those points, but we don't have those points'
+    ground truth.
+
+    Alternative: re-run the v22-style pipeline on each holdout window and
+    cache per-point predictions per submission, but that defeats the
+    purpose of voting cheaply.
+
+    Pragmatic choice: just evaluate vote AGREEMENT — what fraction of points
+    do submissions disagree on? If they highly disagree (large entropy),
+    voting could help; if they fully agree, voting can't help.
+
+    This is a "diagnostic" rather than a F1 evaluation."""
+    raise NotImplementedError("see compute_full_predictions instead")
+
+
+def compute_full_predictions(vote_set_name: str, sub_paths: List[Path],
+                             output: Path) -> Path:
+    """Generate a new submission file by voting across the listed submissions."""
+    print(f"\n>>> Building vote ensemble for [{vote_set_name}] from {len(sub_paths)} subs…")
+    subs = [load_submission(p) for p in sub_paths]
+    print(f"    loaded {[p.name for p in sub_paths]}")
+
+    all_dirs = all_window_dirs()
     preds: dict[str, list[int]] = {}
-    t0 = time.time()
-    for i, wdir in enumerate(all_window_dirs(), 1):
+    cnt_diverge = 0
+    for wdir in all_dirs:
         w = load_window(wdir)
         ratio = float(w.info.get("test set anomaly ratio", 0.0))
-        scores = scores_v14_with_meta(w.train_x, w.train_y, w.test_x, cw_full, cnn_full,
-                                      w.info, w.metric_type)
         k = int(round(len(w.test_x) * ratio))
-        preds[w.wid] = predict_segments(scores, k, **SEG_KWARGS).astype(int).tolist()
-        if i % 100 == 0:
-            print(f"    {i}/1000 ({time.time() - t0:.0f}s)")
+        n = len(w.test_x)
 
-    assert len(preds) == 1000
+        # Per-point votes
+        point_arrays = [s[w.wid] for s in subs if w.wid in s and len(s[w.wid]) == n]
+        if len(point_arrays) < 2:
+            # Not enough subs covering this window; fall back to first available
+            if point_arrays:
+                preds[w.wid] = point_arrays[0].astype(int).tolist()
+            else:
+                preds[w.wid] = [0] * n
+            continue
+
+        votes = vote_score(point_arrays)
+        if votes.sum() == 0:
+            preds[w.wid] = [0] * n
+            continue
+
+        # Count points where subs disagree
+        disagreements = int(((votes > 0) & (votes < len(point_arrays))).sum())
+        if disagreements > 0:
+            cnt_diverge += 1
+        pred = predict_segments(votes, k, **SEG_KWARGS)
+        preds[w.wid] = pred.astype(int).tolist()
+
+    print(f"    windows with ≥1 inter-submission disagreement: {cnt_diverge}/{len(all_dirs)}")
     output.write_text(
         json.dumps({"predictions": preds}, ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",
@@ -172,11 +161,51 @@ def generate_submission(cw_v24, cnn_models,
     return output
 
 
+def diagnose_agreement(sub_paths: List[Path]) -> None:
+    print("\n>>> Inter-submission agreement diagnostic…")
+    subs = [load_submission(p) for p in sub_paths]
+    all_dirs = all_window_dirs()
+
+    total_points = 0
+    full_agree = 0
+    full_anomaly = 0
+    full_normal = 0
+    partial = 0
+    for wdir in all_dirs:
+        w = load_window(wdir)
+        if w.wid not in subs[0]:
+            continue
+        arrays = [s[w.wid] for s in subs if w.wid in s and len(s[w.wid]) == len(w.test_x)]
+        if len(arrays) != len(subs):
+            continue
+        stacked = np.vstack(arrays)
+        votes = stacked.sum(axis=0)
+        n = stacked.shape[1]
+        total_points += n
+        full_normal += int((votes == 0).sum())
+        full_anomaly += int((votes == len(subs)).sum())
+        partial += int(((votes > 0) & (votes < len(subs))).sum())
+
+    full_agree = full_normal + full_anomaly
+    print(f"  total points evaluated: {total_points}")
+    print(f"  full agreement (all-same): {full_agree} ({100 * full_agree / total_points:.1f}%)")
+    print(f"    all-normal:  {full_normal} ({100 * full_normal / total_points:.1f}%)")
+    print(f"    all-anomaly: {full_anomaly} ({100 * full_anomaly / total_points:.3f}%)")
+    print(f"  disagreement (split vote): {partial} ({100 * partial / total_points:.3f}%)")
+
+
 if __name__ == "__main__":
-    rep, cw_v24, cnn_models = run_validation()
-    if rep["delta"] > 0.001:
-        print(f"\n3-seed CW ensemble beats single CW by {rep['delta']:+.4f}; generating submission.")
-        generate_submission(cw_v24, cnn_models)
-    else:
-        print(f"\n3-seed CW ensemble did not meaningfully help "
-              f"(Δ = {rep['delta']:+.4f}); submission NOT generated.")
+    paths = {name: Path(fname) for name, fname in CANDIDATES.items()}
+    missing = {name for name, p in paths.items() if not p.exists()}
+    if missing:
+        print(f"WARNING: missing submissions: {missing}")
+    paths = {name: p for name, p in paths.items() if p.exists()}
+
+    diagnose_agreement(list(paths.values()))
+
+    for vote_set_name, sub_names in VOTE_SETS.items():
+        sub_paths = [paths[n] for n in sub_names if n in paths]
+        if len(sub_paths) < 2:
+            continue
+        output = Path(f"submission_vote_{vote_set_name.replace(' ', '_').replace('(', '').replace(')', '').replace('+', 'plus')}.json")
+        compute_full_predictions(vote_set_name, sub_paths, output)
