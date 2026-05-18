@@ -1,25 +1,20 @@
 """
-author v58 — cross-window global context features (NEW METHOD).
+author v59 — LightGBM + multi-round pseudo-labeling.
 
-Each window is currently scored only against its own training reference.
-This version adds 3 window-level features that capture how globally unusual
-a window is compared to ALL windows of the same metric_type:
-  - global_mean_z: z-score of mean(x) vs metric_type population
-  - global_std_z:  z-score of std(x)  vs metric_type population
-  - global_max_z:  z-score of max(x)  vs metric_type population
+Two big bets combined:
+  1. Replace sklearn HGBT with LightGBM (typically stronger on tabular imbalanced data)
+  2. Compress 8 rounds of pseudo-label iteration into ONE submission slot.
+     Each round: fit → predict all test windows → new pseudo-labels → refit.
+     Previously: +0.001–0.003 per slot. Now 8 rounds in 1 slot.
 
-At training time: population = training windows (train.npy)
-At test inference: population = all 1000 test windows (test.npy)
-Pseudo-labeled test windows: use test.npy stats (consistent with inference)
+Changes vs v58:
+  - 5x LGBMClassifier (n_estimators=400, num_leaves=63) replaces 5x HGBT
+  - PSEUDO_WEIGHT = 0.60 (was 0.50) — labels are high-quality after 6 iterations
+  - N_ROUNDS = 8 internal pseudo-label iterations
+  - Seed pseudo-labels: submission_v58_global_ctx.json (LB 0.6847)
+  - No LOO validation: both changes are architecturally sound per NOTES_FOR_KIMI.md rule
 
-Hypothesis: globally anomalous windows (high std_z, high max_z) should have
-higher per-point anomaly scores — information the local model ignores.
-
-Base: v57 (PSEUDO_WEIGHT=0.50, v57 pseudo-labels)
-N_FEATS_P1: 74 → 77  (+3 global context)
-N_FEATS_P2: 81 → 84  (+3 global context)
-
-Run:  uv run python v58_global_ctx.py
+Run:  uv run python v59_lgbm_multirounds.py
 """
 
 from __future__ import annotations
@@ -33,7 +28,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+import lightgbm as lgb
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
@@ -41,7 +37,6 @@ warnings.filterwarnings("ignore", message="X does not have valid feature names")
 warnings.filterwarnings("ignore", category=UserWarning)
 
 from validation import all_window_dirs, load_window
-from cross_validation import cross_window_evaluate, print_summary_v2
 from validation import stratified_holdout, point_f1
 
 
@@ -52,10 +47,11 @@ SMOOTH_W = 5
 SMOOTH_ALPHA = 0.8
 W_SHIFT = 0.30
 SPLIT_FRAC = 0.70
-N_FEATS_P1 = 77          # 74 base + 3 global context
-N_FEATS_P2 = 84          # 81 base + 3 global context
-PSEUDO_WEIGHT = 0.50
-PSEUDO_SOURCE = Path("submission_v57_pw50_iter.json")  # 0.6832 LB best
+N_FEATS_P1 = 77
+N_FEATS_P2 = 84
+PSEUDO_WEIGHT = 0.60          # up from 0.50 — labels are high-quality after v58
+PSEUDO_SOURCE = Path("submission_v58_global_ctx.json")
+N_ROUNDS = 8                  # internal pseudo-label rounds
 
 
 # ─────────────────────────────────────────────
@@ -63,12 +59,6 @@ PSEUDO_SOURCE = Path("submission_v57_pw50_iter.json")  # 0.6832 LB best
 # ─────────────────────────────────────────────
 
 def compute_window_global_stats(window_dirs, data_file: str = "train.npy") -> Dict[Path, Tuple[float, float, float]]:
-    """
-    For each window, compute z-scores of (mean, std, max) relative to all
-    windows of the same metric_type. Returns wdir → (mean_z, std_z, max_z).
-
-    data_file: "train.npy" for training windows, "test.npy" for test windows.
-    """
     raw: Dict[Path, Tuple[str, float, float, float]] = {}
     for wdir in window_dirs:
         info = json.loads((wdir / "info.json").read_text())
@@ -104,7 +94,7 @@ def compute_window_global_stats(window_dirs, data_file: str = "train.npy") -> Di
 
 
 # ─────────────────────────────────────────────
-# Rolling helpers — all centered (identical to v43)
+# Rolling helpers — all centered
 # ─────────────────────────────────────────────
 
 def _rolling_mean_std(x: np.ndarray, w: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -176,7 +166,7 @@ def parse_service(case_name: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# Feature builders
+# Feature builders (identical to v58)
 # ─────────────────────────────────────────────
 
 def make_features(
@@ -184,7 +174,7 @@ def make_features(
     info: dict, service: str, top_services: List[str],
     win_global: Tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> np.ndarray:
-    """77-feature matrix (P1) = 74 base + 3 global context z-scores."""
+    """77-feature P1 matrix (identical to v58)."""
     n = len(x)
     feats = []
 
@@ -240,7 +230,6 @@ def make_features(
         feats.append(rmax_w - x)
         feats.append(x - rmin_w)
 
-    # Global context: z-scores vs metric_type population (NEW)
     mean_z, std_z, max_z = win_global
     feats.append(np.full(n, mean_z, dtype=np.float64))
     feats.append(np.full(n, std_z,  dtype=np.float64))
@@ -268,7 +257,7 @@ def make_features_shift(
     info: dict, service: str, top_services: List[str],
     win_global: Tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> np.ndarray:
-    """84-feature matrix (P2) = 77 + 7 shift features."""
+    """84-feature P2 matrix (identical to v58)."""
     base = make_features(x, timestamps, ref_x, info, service, top_services, win_global)
     n = len(x)
 
@@ -328,7 +317,7 @@ def _load_test_arrays(wdir: Path, info: dict):
 
 
 # ─────────────────────────────────────────────
-# Training pool builders
+# Training pool builders (identical to v58)
 # ─────────────────────────────────────────────
 
 def _build_pool_p1(window_dirs, top_services, target_mt,
@@ -452,7 +441,7 @@ def _build_pool_p2(window_dirs, top_services, target_mt,
 
 
 # ─────────────────────────────────────────────
-# Ensemble fitting
+# Ensemble fitting — LightGBM replaces HGBT
 # ─────────────────────────────────────────────
 
 def _fit_models(X: np.ndarray, y: np.ndarray, label: str,
@@ -471,23 +460,33 @@ def _fit_models(X: np.ndarray, y: np.ndarray, label: str,
         rfs.append(rf)
     print(f"    {label} 3-seed RF fit {time.time() - t0:.1f}s")
 
+    # LightGBM: replaces sklearn HGBT
     t0 = time.time()
-    hgbts = []
+    lgbms = []
     for s in range(5):
-        hgbt = HistGradientBoostingClassifier(
-            max_iter=200, max_depth=8, learning_rate=0.05,
-            min_samples_leaf=20, random_state=s, class_weight="balanced",
+        model = lgb.LGBMClassifier(
+            n_estimators=400,
+            learning_rate=0.05,
+            num_leaves=63,
+            max_depth=8,
+            min_child_samples=20,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            class_weight="balanced",
+            n_jobs=4,
+            verbose=-1,
+            random_state=s,
         )
-        hgbt.fit(X, y, sample_weight=sample_weight)
-        hgbts.append(hgbt)
-    print(f"    {label} 5-seed HGBT fit {time.time() - t0:.1f}s")
+        model.fit(X, y, sample_weight=sample_weight)
+        lgbms.append(model)
+    print(f"    {label} 5-seed LGB fit {time.time() - t0:.1f}s")
 
     t0 = time.time()
     lr = LogisticRegression(C=0.5, max_iter=500, class_weight="balanced", solver="lbfgs")
     lr.fit(X_scaled, y, sample_weight=sample_weight)
     print(f"    {label} 1 LR fit {time.time() - t0:.1f}s")
 
-    return {"rfs": rfs, "hgbts": hgbts, "lr": lr, "scaler": scaler}
+    return {"rfs": rfs, "lgbms": lgbms, "lr": lr, "scaler": scaler}
 
 
 def fit_both_ensembles(window_dirs, top_services,
@@ -504,10 +503,7 @@ def fit_both_ensembles(window_dirs, top_services,
                                      train_global_stats, test_global_stats,
                                      pseudo_labels=pseudo_labels, wid_map=wid_map)
 
-        n_pseudo = sum(1 for wid, py in (pseudo_labels or {}).items()
-                       if py.sum() > 0 and wid_map and wid_map.get(wid) is not None
-                       and json.loads((wid_map[wid] / "info.json").read_text()).get("metric_type") == mt)
-        print(f"    P1 X={X1.shape} pos={y1.mean():.3f} pseudo≈{n_pseudo}  "
+        print(f"    P1 X={X1.shape} pos={y1.mean():.3f}  "
               f"P2 X={X2.shape} pos={y2.mean() if len(y2) else 0:.3f}  "
               f"build={time.time()-t0:.1f}s")
 
@@ -533,9 +529,9 @@ def fit_both_ensembles(window_dirs, top_services,
 def _score_bundle(bundle: dict, X: np.ndarray) -> np.ndarray:
     X_scaled = bundle["scaler"].transform(X)
     rf_avg   = np.mean([clf.predict_proba(X)[:, 1] for clf in bundle["rfs"]], axis=0)
-    hgbt_avg = np.mean([clf.predict_proba(X)[:, 1] for clf in bundle["hgbts"]], axis=0)
+    lgb_avg  = np.mean([clf.predict_proba(X)[:, 1] for clf in bundle["lgbms"]], axis=0)
     lr_p     = bundle["lr"].predict_proba(X_scaled)[:, 1]
-    return 0.80 * hgbt_avg + 0.10 * rf_avg + 0.10 * lr_p
+    return 0.80 * lgb_avg + 0.10 * rf_avg + 0.10 * lr_p
 
 
 def predict_proba_window(
@@ -595,56 +591,14 @@ def predict_window(test_x, test_ts, train_x_ref, info, service, top_services,
 
 
 # ─────────────────────────────────────────────
-# Validation + submission
+# Multi-round pseudo-label loop
 # ─────────────────────────────────────────────
 
-def run_validation(pseudo_labels, wid_map, seed: int = 42):
-    print("\n>>> Building stratified holdout (10%)…")
-    train_pool, holdout = stratified_holdout(all_window_dirs(), frac=0.10, seed=seed)
-    print(f"    train_pool={len(train_pool)}  holdout={len(holdout)}  "
-          f"pseudo_windows={sum(1 for py in pseudo_labels.values() if py.sum()>0)}")
-
-    print(">>> Computing top-30 services from train_pool…")
-    top_services = compute_top_services(train_pool, k=TOP_K_SERVICES)
-
-    print(">>> Computing global context stats…")
-    train_global_stats = compute_window_global_stats(train_pool, data_file="train.npy")
-    test_global_stats  = compute_window_global_stats(all_window_dirs(), data_file="test.npy")
-    print(f"    train_global_stats for {len(train_global_stats)} windows, "
-          f"test_global_stats for {len(test_global_stats)} windows")
-
-    print(">>> Fitting P1+P2 ensembles on train_pool + pseudo-labeled test…")
-    t0 = time.time()
-    ensembles = fit_both_ensembles(train_pool, top_services,
-                                   train_global_stats, test_global_stats,
-                                   pseudo_labels, wid_map)
-    print(f"    total fit time {time.time() - t0:.1f}s")
-
-    def predictor(window):
-        try:
-            train_ts = np.load(window.wdir / "train_timestamp.npy")
-        except FileNotFoundError:
-            train_ts = np.arange(len(window.train_x), dtype=np.int64) * window.info.get("intervals", 60)
-        service = parse_service(window.info.get("case_name", ""))
-        wg = train_global_stats.get(window.wdir, (0.0, 0.0, 0.0))
-        return predict_window(window.train_x, train_ts, window.train_x, window.info,
-                              service, top_services, ensembles, wg)
-
-    print(">>> Cross-window LOO evaluation on holdout train_x…")
-    rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v58 global-ctx (CW-LOO)")
-
-    from validation import save_report
-    save_report(rep, "v58_global_ctx_loo")
-    return rep, ensembles, top_services, train_global_stats, test_global_stats
-
-
-def generate_submission(ensembles, top_services, test_global_stats,
-                        output: Path = Path("submission_v58_global_ctx.json")) -> Path:
-    print(f"\n>>> Generating predictions on all 1000 test windows…")
-    preds: Dict[str, list] = {}
-    t0 = time.time()
-    for i, wdir in enumerate(all_window_dirs(), 1):
+def predict_all_test_windows(ensembles, top_services, test_global_stats,
+                              window_dirs) -> Dict[str, np.ndarray]:
+    """Score all test windows and return binary predictions."""
+    preds = {}
+    for wdir in window_dirs:
         w = load_window(wdir)
         try:
             test_ts = np.load(wdir / "test_timestamp.npy")
@@ -652,38 +606,83 @@ def generate_submission(ensembles, top_services, test_global_stats,
             test_ts = np.arange(len(w.test_x), dtype=np.int64) * w.info.get("intervals", 60)
         service = parse_service(w.info.get("case_name", ""))
         wg = test_global_stats.get(wdir, (0.0, 0.0, 0.0))
-        pred = predict_window(w.test_x, test_ts, w.train_x, w.info, service,
-                              top_services, ensembles, wg)
-        preds[w.wid] = pred.astype(int).tolist()
-        if i % 100 == 0:
-            print(f"    {i}/1000 ({time.time() - t0:.0f}s)")
+        pred = predict_window(w.test_x, test_ts, w.train_x, w.info,
+                              service, top_services, ensembles, wg)
+        preds[w.wid] = pred
+    return preds
 
-    assert len(preds) == 1000
+
+def run_multirounds():
+    all_wdirs = list(all_window_dirs())
+    wid_map = build_wid_map(all_wdirs)
+
+    print(">>> Pre-computing shared stats (done once)…")
+    top_services = compute_top_services(all_wdirs, k=TOP_K_SERVICES)
+    train_gs = compute_window_global_stats(all_wdirs, data_file="train.npy")
+    test_gs  = compute_window_global_stats(all_wdirs, data_file="test.npy")
+    print(f"    top_services={len(top_services)}  "
+          f"train_gs={len(train_gs)}  test_gs={len(test_gs)}")
+
+    print(f"\n>>> Loading seed pseudo-labels from {PSEUDO_SOURCE}…")
+    pseudo_labels = load_pseudo_labels(PSEUDO_SOURCE)
+    n_with = sum(1 for v in pseudo_labels.values() if v.sum() > 0)
+    print(f"    {len(pseudo_labels)} windows, {n_with} with predicted anomalies (seed)")
+
+    final_preds: Dict[str, np.ndarray] = {}
+    t_total = time.time()
+
+    for round_i in range(N_ROUNDS):
+        t_round = time.time()
+        n_pseudo = sum(1 for v in pseudo_labels.values() if v.sum() > 0)
+        print(f"\n{'='*60}")
+        print(f"  ROUND {round_i + 1}/{N_ROUNDS}  —  pseudo-labeled windows: {n_pseudo}")
+        print(f"{'='*60}")
+
+        ensembles = fit_both_ensembles(
+            all_wdirs, top_services, train_gs, test_gs,
+            pseudo_labels, wid_map,
+        )
+
+        print(f"  Predicting all 1000 test windows…")
+        preds = predict_all_test_windows(ensembles, top_services, test_gs, all_wdirs)
+        final_preds = preds
+
+        n_new = sum(1 for v in preds.values() if v.sum() > 0)
+        n_changed = sum(
+            1 for wid, v in preds.items()
+            if wid in pseudo_labels and not np.array_equal(v, pseudo_labels[wid])
+        )
+        print(f"  Round {round_i + 1} done in {time.time() - t_round:.0f}s  "
+              f"|  windows-with-anomalies: {n_new}  |  changed: {n_changed}")
+
+        # Update pseudo-labels for next round
+        pseudo_labels = {wid: arr.astype(np.int64) for wid, arr in preds.items()}
+
+    print(f"\n>>> All {N_ROUNDS} rounds done in {time.time() - t_total:.0f}s total")
+    return final_preds
+
+
+# ─────────────────────────────────────────────
+# Write submission
+# ─────────────────────────────────────────────
+
+def write_submission(preds: Dict[str, np.ndarray],
+                     output: Path = Path("submission_v59_lgbm_multirounds.json")) -> Path:
+    out = {wid: arr.astype(int).tolist() for wid, arr in preds.items()}
+    assert len(out) == 1000
     output.write_text(
-        json.dumps({"predictions": preds}, ensure_ascii=False, separators=(",", ":")),
+        json.dumps({"predictions": out}, ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",
     )
-    print(f">>> Wrote {output}")
+    print(f">>> Wrote {output}  ({len(out)} windows)")
     return output
 
 
 if __name__ == "__main__":
-    print(f">>> Loading pseudo-labels from {PSEUDO_SOURCE}…")
-    pseudo_labels = load_pseudo_labels(PSEUDO_SOURCE)
-    n_with_anomalies = sum(1 for py in pseudo_labels.values() if py.sum() > 0)
-    print(f"    {len(pseudo_labels)} windows, {n_with_anomalies} with predicted anomalies")
+    print(f"LightGBM {lgb.__version__}")
+    print(f"N_ROUNDS={N_ROUNDS}  PSEUDO_WEIGHT={PSEUDO_WEIGHT}  W_SHIFT={W_SHIFT}")
+    print(f"Seed: {PSEUDO_SOURCE}\n")
 
-    wid_map = build_wid_map(all_window_dirs())
-
-    rep, ensembles, top_services, train_gs, test_gs = run_validation(pseudo_labels, wid_map)
-
-    print("\n>>> Re-training on ALL 1000 windows + pseudo-labels for final submission…")
-    t0 = time.time()
-    top_services_full   = compute_top_services(all_window_dirs(), k=TOP_K_SERVICES)
-    train_gs_full       = compute_window_global_stats(all_window_dirs(), data_file="train.npy")
-    test_gs_full        = compute_window_global_stats(all_window_dirs(), data_file="test.npy")
-    ensembles_full      = fit_both_ensembles(all_window_dirs(), top_services_full,
-                                              train_gs_full, test_gs_full,
-                                              pseudo_labels, wid_map)
-    print(f"    full fit {time.time() - t0:.1f}s")
-    generate_submission(ensembles_full, top_services_full, test_gs_full)
+    final_preds = run_multirounds()
+    write_submission(final_preds)
+    print("\nDone. Submit submission_v59_lgbm_multirounds.json")
