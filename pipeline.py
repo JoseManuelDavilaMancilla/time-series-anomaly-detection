@@ -1,30 +1,25 @@
 """
-author v32 — Edge-fix in predict_segments.
+author v33 — investigate ALL failure cases (across all metric types) to find
+common patterns for further post-processing fixes.
 
-v31 investigation revealed: ResourceUtilizationRate's 0.95 ceiling is driven
-by TWO specific failure modes in `predict_segments` at window boundaries, not
-by the model:
+v31 showed that ResourceUtil's 0.95 ceiling came from 2/17 windows with
+specific edge-effect bugs. v32 fixed one of them (SuccessRate) via reflective
+padding. This script extends the investigation to every holdout window where
+v32's pipeline still scores below 0.9 F1, looking for common patterns we can
+post-process around.
 
-  1. **End-of-window false positives**: when the time series naturally drifts
-     up at the end (e.g., wid=944), the smoothed score at the last 5 points
-     becomes a local maximum and gets selected as anomaly.
-  2. **Start-of-window misalignment**: convolution smoothing with mode='same'
-     downweights position 0 (fewer samples in the kernel), so segments that
-     truly start at position 0 get shifted rightward (e.g., wid=967: truth
-     [0, 24], pred [4, 28]).
+Outputs a structured table: (wid, metric_type, category, ratio, F1, failure
+mode classification). Failure mode is one of:
+  - "off_by_few" — predicted segment exists but is shifted N positions
+  - "extra_segment" — model predicted a real segment + a phantom one
+  - "missing_segment" — model missed a true segment entirely
+  - "wrong_length" — segment overlaps but is too short/long
+  - "split_segment" — one truth seg split into multiple predicted segs
+  - "other"
 
-Fixes:
-  A. **Reflect-padding for smoothing**: replace mode='same' with explicit
-     edge reflection so positions 0 and N-1 see the same kernel contribution
-     as interior positions.
-  B. **Boundary penalty**: optionally suppress segment centers that fall in
-     the first/last few positions UNLESS the smoothed score is sharply higher
-     there than its interior peak (i.e., a real boundary anomaly).
+Then for each common pattern, propose a specific post-processing fix.
 
-Sweep both axes against v22 (no edge fix). Compare across all categories,
-not just ResourceUtil — the fix should be neutral or positive on others.
-
-Run:  uv run python v32_edge_fix.py
+Run:  uv run python v33_investigate_all.py
 """
 
 from __future__ import annotations
@@ -32,8 +27,9 @@ from __future__ import annotations
 import json
 import time
 import warnings
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Optional
+from typing import List, Tuple
 
 import numpy as np
 import torch
@@ -47,241 +43,201 @@ from shared_lib import (
     normalize_scores,
     online_ensemble,
     per_window_rf_score,
-    predict_topk,
 )
 from v6_cnn import SPECIALIZED, build_training_pool as v6_pool
 from v7_cnn_ensemble import CNN_SEEDS, ensemble_cnn_score, fit_cnn_with_seed
-from v22_metadata_features import build_metadata_hybrid, scores_v14_with_meta
+from v22_metadata_features import build_metadata_hybrid
+from v32_edge_fix import predict_segments_v32
 from validation import (
     all_window_dirs,
-    evaluate,
     load_window,
-    print_summary,
+    point_f1,
     save_report,
     stratified_holdout,
+    time_split,
 )
 
-
-def predict_segments_v32(
-    scores: np.ndarray,
-    k: int,
-    *,
-    smooth: int = 3,
-    thr_frac: float = 0.7,
-    small_k_cutoff: int = 4,
-    max_seg: Optional[int] = None,
-    edge_pad_mode: str = "reflect",          # 'reflect' or 'same' (legacy)
-    boundary_penalty: float = 0.0,           # multiply scores by (1 - bp) within edge_width of boundaries unless they're a clear winner
-    edge_width: int = 5,
-) -> np.ndarray:
-    """Like predict_segments but with edge-fix options.
-
-    edge_pad_mode='reflect': use reflective padding for the smoothing
-        convolution so positions 0 and N-1 see a full kernel.
-    boundary_penalty>0: scale scores within `edge_width` of either boundary
-        DOWN by (1 - boundary_penalty), UNLESS those scores are higher than
-        the interior peak (in which case keep them).
-    """
-    n = len(scores)
-    pred = np.zeros(n, dtype=int)
-    if k <= 0:
-        return pred
-    if k <= small_k_cutoff:
-        return predict_topk(scores, k)
-
-    s_raw = np.asarray(scores, dtype=np.float64).copy()
-
-    # Edge-aware smoothing
-    if smooth > 1:
-        kernel = np.ones(smooth) / smooth
-        if edge_pad_mode == "reflect":
-            half = smooth // 2
-            padded = np.concatenate([s_raw[half-1::-1] if half > 0 else s_raw[:0],
-                                     s_raw,
-                                     s_raw[-1:-half-1:-1] if half > 0 else s_raw[:0]])
-            # Convolve in 'valid' over the padded series → length n
-            s = np.convolve(padded, kernel, mode="valid")
-            # Handle off-by-one from asymmetric kernel
-            if len(s) > n:
-                s = s[: n]
-            elif len(s) < n:
-                # Fall back to same-mode
-                s = np.convolve(s_raw, kernel, mode="same")
-        else:
-            s = np.convolve(s_raw, kernel, mode="same")
-    else:
-        s = s_raw.copy()
-
-    # Boundary penalty
-    if boundary_penalty > 0.0 and edge_width > 0 and edge_width * 2 < n:
-        interior_max = s[edge_width:-edge_width].max() if n > 2 * edge_width else s.max()
-        # Penalize edges only if they're below interior_max (i.e., not a true boundary anomaly)
-        for j in range(min(edge_width, n)):
-            if s[j] < interior_max:
-                s[j] *= (1.0 - boundary_penalty)
-            if n - 1 - j >= 0 and s[n - 1 - j] < interior_max:
-                s[n - 1 - j] *= (1.0 - boundary_penalty)
-
-    budget = int(k)
-    order = np.argsort(-s)
-    for center in order:
-        if budget <= 0:
-            break
-        if pred[center] == 1:
-            continue
-        peak = s[center]
-        if peak <= 0:
-            break
-        thr = thr_frac * peak
-
-        pred[center] = 1
-        budget -= 1
-
-        L = R = int(center)
-        grew = True
-        while grew and budget > 0:
-            grew = False
-            if L > 0 and pred[L - 1] == 0 and s[L - 1] >= thr:
-                L -= 1
-                pred[L] = 1
-                budget -= 1
-                grew = True
-                if budget <= 0:
-                    break
-            if R < n - 1 and pred[R + 1] == 0 and s[R + 1] >= thr:
-                R += 1
-                pred[R] = 1
-                budget -= 1
-                grew = True
-            if max_seg is not None and (R - L + 1) >= max_seg:
-                break
-
-    return pred
-
-
+SEG_KWARGS = dict(smooth=3, thr_frac=0.7, small_k_cutoff=4, max_seg=60,
+                  edge_pad_mode="reflect", boundary_penalty=0.0, edge_width=5)
 CNN_WEIGHT = 0.35
-SEG_KWARGS_BASE = dict(smooth=3, thr_frac=0.7, small_k_cutoff=4, max_seg=60)
 
 
-def scores_v22(train_x, train_y, test_x, cw, cnn_models, info, metric_type):
-    return scores_v14_with_meta(train_x, train_y, test_x, cw, cnn_models, info, metric_type)
+def true_segments(mask: np.ndarray) -> List[Tuple[int, int]]:
+    if mask.sum() == 0:
+        return []
+    diffs = np.diff(np.concatenate([[0], mask.astype(int), [0]]))
+    starts = np.where(diffs == 1)[0]
+    ends = np.where(diffs == -1)[0] - 1
+    return list(zip(starts.tolist(), ends.tolist()))
 
 
-def run_validation(seed: int = 42) -> dict:
-    print("\n>>> Building stratified holdout (10%)…")
-    train_pool, holdout = stratified_holdout(all_window_dirs(), frac=0.10, seed=seed)
+def classify_failure(truth: List[Tuple[int, int]], pred: List[Tuple[int, int]]) -> str:
+    """Determine the failure mode by comparing truth vs prediction segments."""
+    if not truth and not pred:
+        return "no_anomaly_both"
+    if not truth and pred:
+        return "phantom_anomaly"  # truth has none, we predicted some
+    if truth and not pred:
+        return "missing_all"
+    if len(truth) == 1 and len(pred) == 1:
+        ts, te = truth[0]; ps, pe = pred[0]
+        i_start, i_end = max(ts, ps), min(te, pe)
+        if i_end < i_start:
+            return "no_overlap"
+        intersection = i_end - i_start + 1
+        truth_len = te - ts + 1
+        pred_len = pe - ps + 1
+        if abs(ps - ts) <= 5 and abs(pe - te) <= 5 and pred_len == truth_len:
+            return "off_by_few"
+        if pred_len < truth_len * 0.7:
+            return "too_short"
+        if pred_len > truth_len * 1.3:
+            return "too_long"
+        return "shifted"
+    if len(truth) == 1 and len(pred) > 1:
+        return "split_segment"
+    if len(truth) > 1 and len(pred) == 1:
+        return "merged_segments"
+    if len(pred) > len(truth):
+        return "extra_segments"
+    return "other"
+
+
+def ensemble_score(channels, category):
+    cw_s, cnn_s, if_s, g_s, local_s, pw_s = (channels[k] for k in ["cw", "cnn", "if", "g", "local", "pw"])
+    if category == "constant_train":
+        return (0.50 - CNN_WEIGHT) * cw_s + 0.50 * if_s + CNN_WEIGHT * cnn_s
+    if category == "disjoint":
+        return 0.35 * cw_s + 0.30 * g_s + (0.35 - CNN_WEIGHT) * if_s + CNN_WEIGHT * cnn_s
+    if category == "partial_overlap":
+        return 0.35 * cw_s + 0.35 * pw_s + (0.30 - CNN_WEIGHT) * local_s + CNN_WEIGHT * cnn_s
+    if category == "test_within_train":
+        return (0.50 - CNN_WEIGHT) * cw_s + 0.50 * pw_s + CNN_WEIGHT * cnn_s
+    return np.zeros(len(cw_s))
+
+
+def compute_channels(train_x, train_y, test_x, cw, cnn_models, info, metric_type):
+    cw_s = normalize_scores(cw.predict_proba(test_x, metric_type=metric_type, info=info))
+    cnn_s = normalize_scores(ensemble_cnn_score(cnn_models, test_x))
+    if_s = normalize_scores(isolation_forest_test(test_x, train_y))
+    g_s = normalize_scores(global_distance_score(train_x, test_x))
+    local_s = normalize_scores(online_ensemble(test_x, window=15))
+    pw_s = normalize_scores(per_window_rf_score(train_x, train_y, test_x)) if train_y.sum() > 0 \
+        else np.zeros(len(test_x))
+    return {"cw": cw_s, "cnn": cnn_s, "if": if_s, "g": g_s, "local": local_s, "pw": pw_s}
+
+
+def ascii_sparkline(values: np.ndarray, width: int = 80) -> str:
+    if len(values) == 0:
+        return ""
+    chars = " ▁▂▃▄▅▆▇█"
+    v = np.asarray(values, dtype=float)
+    if v.max() == v.min():
+        return chars[4] * min(width, len(v))
+    norm = (v - v.min()) / (v.max() - v.min())
+    if len(v) <= width:
+        idx = list(range(len(v)))
+    else:
+        idx = np.linspace(0, len(v) - 1, width).astype(int)
+    return "".join(chars[min(8, int(round(norm[i] * 8)))] for i in idx)
+
+
+def mark_segments(n: int, seglist: List[Tuple[int, int]], width: int = 80) -> str:
+    mask = np.zeros(n, dtype=int)
+    for s, e in seglist:
+        mask[s : e + 1] = 1
+    chars = ".X"
+    if n <= width:
+        idx = list(range(n))
+    else:
+        idx = np.linspace(0, n - 1, width).astype(int)
+    return "".join(chars[mask[i]] for i in idx)
+
+
+def investigate():
+    print(">>> Building stratified holdout (10%)…")
+    train_pool, holdout = stratified_holdout(all_window_dirs(), frac=0.10, seed=42)
     print(f"    train_pool={len(train_pool)}  holdout={len(holdout)}")
 
-    print(">>> Training metadata CW + 3-seed CNN…")
-    t0 = time.time()
+    print(">>> Training metadata CW + 3-seed CNN ensemble…")
     cw = build_metadata_hybrid(train_pool, mode="intervals")
-    print(f"    cw fit {time.time() - t0:.1f}s")
     Xc, yc = v6_pool(train_pool)
     cnn_models = []
     for s in CNN_SEEDS:
-        t0 = time.time()
         cnn_models.append(fit_cnn_with_seed(Xc, yc, s))
-        print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
 
-    def make_predictor(seg_kwargs):
-        def pred(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
-            scores = scores_v22(sub_tr_x, sub_tr_y, sub_te_x, cw, cnn_models, info,
-                                info.get("metric_type", "ALL"))
-            return predict_segments_v32(scores, int(round(len(sub_te_x) * ratio)),
-                                        **seg_kwargs)
-        return pred
+    print(">>> Evaluating all 100 holdout windows with v32 edge fix…")
+    failures = []
+    f1_by_metric = defaultdict(list)
+    failure_modes = Counter()
+    failures_by_metric = defaultdict(list)
 
-    variants = {
-        "baseline (same, no penalty)": dict(**SEG_KWARGS_BASE, edge_pad_mode="same",
-                                            boundary_penalty=0.0, edge_width=5),
-        "reflect (no penalty)":        dict(**SEG_KWARGS_BASE, edge_pad_mode="reflect",
-                                            boundary_penalty=0.0, edge_width=5),
-        "reflect + pen=0.10":          dict(**SEG_KWARGS_BASE, edge_pad_mode="reflect",
-                                            boundary_penalty=0.10, edge_width=5),
-        "reflect + pen=0.20":          dict(**SEG_KWARGS_BASE, edge_pad_mode="reflect",
-                                            boundary_penalty=0.20, edge_width=5),
-        "reflect + pen=0.30":          dict(**SEG_KWARGS_BASE, edge_pad_mode="reflect",
-                                            boundary_penalty=0.30, edge_width=5),
-    }
-
-    results = {}
-    for name, kwargs in variants.items():
-        print(f"\n>>> Eval [{name}]…")
-        rep = evaluate(make_predictor(kwargs), holdout)
-        print_summary(rep, name=name)
-        results[name] = rep
-
-    print("\n──────  summary ──────")
-    base = results["baseline (same, no penalty)"]["overall_f1"]
-    rows = sorted(results.items(), key=lambda kv: -kv[1]["overall_f1"])
-    for name, rep in rows:
-        d = rep["overall_f1"] - base
-        print(f"  {name:<32}  F1={rep['overall_f1']:.4f}  Δ_vs_base={d:+.4f}")
-
-    # Per-metric breakdown for top 2
-    print("\n>>> Per-metric for top 2 variants:")
-    for name, rep in rows[:2]:
-        print(f"\n  [{name}]")
-        for mt, st in sorted(rep["by_metric_type"].items()):
-            base_f1 = results["baseline (same, no penalty)"]["by_metric_type"][mt]["mean_f1"]
-            d_mt = st["mean_f1"] - base_f1
-            print(f"    {mt:<28}  F1={st['mean_f1']:.4f}  Δ={d_mt:+.4f}")
-
-    winner = rows[0][0]
-    report = {
-        "results": {name: r["overall_f1"] for name, r in results.items()},
-        "winner": winner,
-        "delta_vs_baseline": rows[0][1]["overall_f1"] - base,
-        "seed": seed,
-        "n_holdout": len(holdout),
-    }
-    save_report(report, "v32_edge_fix")
-    return report, cw, cnn_models, variants
-
-
-def generate_submission(seg_kwargs: dict, cw, cnn_models,
-                        output: Path = Path("submission_edge_fix.json")) -> Path:
-    print(f"\n>>> Re-training on ALL 1000 windows (seg_kwargs={seg_kwargs})…")
-    t0 = time.time()
-    cw_full = build_metadata_hybrid(all_window_dirs(), mode="intervals")
-    print(f"    cw fit {time.time() - t0:.1f}s")
-
-    Xc, yc = v6_pool(all_window_dirs())
-    cnn_full = []
-    for s in CNN_SEEDS:
-        t0 = time.time()
-        cnn_full.append(fit_cnn_with_seed(Xc, yc, s))
-        print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
-
-    print(">>> Generating predictions…")
-    preds: dict[str, list[int]] = {}
-    t0 = time.time()
-    for i, wdir in enumerate(all_window_dirs(), 1):
+    for wdir in holdout:
         w = load_window(wdir)
-        ratio = float(w.info.get("test set anomaly ratio", 0.0))
-        scores = scores_v22(w.train_x, w.train_y, w.test_x, cw_full, cnn_full, w.info,
-                            w.metric_type)
-        k = int(round(len(w.test_x) * ratio))
-        preds[w.wid] = predict_segments_v32(scores, k, **seg_kwargs).astype(int).tolist()
-        if i % 100 == 0:
-            print(f"    {i}/1000 ({time.time() - t0:.0f}s)")
+        sub_tr_x, sub_tr_y, sub_te_x, sub_te_y = time_split(w.train_x, w.train_y, frac=0.70)
+        ratio = float(sub_te_y.mean()) if len(sub_te_y) else 0.0
+        category = categorize_window(sub_tr_x, sub_te_x)
+        chans = compute_channels(sub_tr_x, sub_tr_y, sub_te_x, cw, cnn_models, w.info,
+                                 w.metric_type)
+        score = ensemble_score(chans, category)
+        k = int(round(len(sub_te_x) * ratio))
+        pred = predict_segments_v32(score, k, **SEG_KWARGS)
+        f1 = point_f1(sub_te_y, pred)
 
-    assert len(preds) == 1000
-    output.write_text(
-        json.dumps({"predictions": preds}, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    print(f">>> Wrote {output}")
-    return output
+        truth_segs = true_segments(sub_te_y)
+        pred_segs = true_segments(pred)
+        mode = classify_failure(truth_segs, pred_segs)
+
+        f1_by_metric[w.metric_type].append(f1)
+        if f1 < 0.9:
+            failure_modes[mode] += 1
+            failures_by_metric[w.metric_type].append({
+                "wid": w.wid, "f1": f1, "mode": mode, "category": category,
+                "n": len(sub_te_x), "ratio": ratio, "k": k,
+                "truth_segs": truth_segs, "pred_segs": pred_segs,
+                "sub_te_x": sub_te_x, "sub_te_y": sub_te_y, "pred": pred,
+                "score": score,
+            })
+
+    # Summary by metric type
+    print(f"\n>>> Per-metric F1 summary (after v32 reflect fix):")
+    for mt in sorted(f1_by_metric):
+        vals = f1_by_metric[mt]
+        n_lt9 = sum(1 for f in vals if f < 0.9)
+        print(f"  {mt:<28}  n={len(vals)}  mean_F1={np.mean(vals):.4f}  "
+              f"n(F1<0.9)={n_lt9}")
+
+    print(f"\n>>> Failure mode counts (F1 < 0.9):")
+    for mode, cnt in failure_modes.most_common():
+        print(f"  {mode:<20}  {cnt}")
+
+    # Detailed look at the worst failures
+    print(f"\n>>> Detailed analysis of failure windows by metric type:")
+    for mt, fails in sorted(failures_by_metric.items()):
+        if not fails:
+            continue
+        print(f"\n  === {mt} ({len(fails)} failures) ===")
+        for fail in sorted(fails, key=lambda x: x["f1"]):
+            r = fail
+            print(f"\n  wid={r['wid']}  F1={r['f1']:.3f}  mode={r['mode']}  "
+                  f"cat={r['category']}  ratio={r['ratio']:.3f}  k={r['k']}")
+            print(f"    truth: {r['truth_segs']}    pred: {r['pred_segs']}")
+            print(f"    series: {ascii_sparkline(r['sub_te_x'])}")
+            print(f"    score : {ascii_sparkline(r['score'])}")
+            print(f"    truth : {mark_segments(r['n'], r['truth_segs'])}")
+            print(f"    pred  : {mark_segments(r['n'], r['pred_segs'])}")
+
+    # Clean before save
+    for mt, fails in failures_by_metric.items():
+        for r in fails:
+            for key in ("sub_te_x", "sub_te_y", "pred", "score"):
+                r.pop(key, None)
+    save_report({
+        "f1_by_metric": {k: list(v) for k, v in f1_by_metric.items()},
+        "failure_modes": dict(failure_modes),
+        "failures_by_metric": dict(failures_by_metric),
+    }, "v33_investigate_all")
 
 
 if __name__ == "__main__":
-    rep, cw, cnn_models, variants = run_validation()
-    if rep["winner"] != "baseline (same, no penalty)" and rep["delta_vs_baseline"] > 0.0005:
-        winner_kwargs = variants[rep["winner"]]
-        print(f"\n{rep['winner']} beats baseline by {rep['delta_vs_baseline']:+.4f}; "
-              "generating submission.")
-        generate_submission(winner_kwargs, cw, cnn_models)
-    else:
-        print(f"\nEdge fix did not meaningfully help "
-              f"(best Δ = {rep['delta_vs_baseline']:+.4f}); submission NOT generated.")
+    investigate()
