@@ -1,27 +1,25 @@
 """
-author v11 — Ablation of teammate's v12 changes inside the author pipeline.
+author v12 — Per-metric CNN routing.
 
-teammate's v12 (0.5665 LB) changed three things from v8:
-  A. Stronger CW: 500 trees / depth 15 (vs 200 / 12)
-  B. IsolationForest-on-test replaces online_ensemble for `disjoint` AND
-     `constant_train` categories.
-  C. Reweighting: disjoint = 0.35 cw + 0.30 g + 0.35 if (vs 0.30 / 0.30 / 0.40),
-                   constant_train = 0.50 cw + 0.50 if (vs 0.40 / 0.60).
+The hybrid per-metric CW model is +0.0089 over global CW on validation. The CNN
+ensemble is also +0.011 over single-seed CNN. The natural extension: train
+6 CNN ensembles, one per metric_type, and route at inference time.
 
-We don't know which of A/B/C contributed teammate's +0.018, and we don't know
-whether they still help on top of the author stack (hybrid CW + 3-seed CNN
-ensemble + tuned segments, currently 0.6111 LB).
+Hypothesis: per-metric specialization should help the CNN for the same 3 metric
+types where it helped the CW model (ErrorCount, ResourceUtilizationRate,
+SuccessRate). On those types, train a dedicated 3-seed CNN ensemble on that
+type's data only. For the other 3 (Count, LatencySecond, QPS), use the global
+CNN ensemble.
 
-Six variants tested, all using the v9 segtuned segment params:
+Caveat: per-metric training pool is ~1/6 the size (~15k samples instead of
+90k). Subsampling negatives to 30% leaves ~5k per type, which is borderline
+for a CNN. Will check loss curves and skip per-metric routing for any type
+with < 3k samples.
 
-  v_base       — current author best (0.6111 LB baseline)
-  +stronger_cw — A only
-  +if_disjoint — B (disjoint windows only)
-  +if_both     — B (disjoint + constant_train)
-  +v12_weights — C only
-  +all_v12     — A + B(both) + C
+Stacks on top of `submission_kimi_combo_all_v12.json` (v11 winning config):
+hybrid CW + segments + 3-seed CNN + all_v12 ensemble weights.
 
-Run:  uv run python v11_kimi_v12_ablation.py
+Run:  uv run python v12_per_metric_cnn.py
 """
 
 from __future__ import annotations
@@ -49,8 +47,10 @@ from shared_lib import (
 )
 from v6_cnn import (
     SPECIALIZED,
-    build_training_pool,
-    cnn_score,
+    SEED,
+    SUBSAMPLE_NEG,
+    build_contexts as v6_build_contexts,
+    build_training_pool as v6_build_training_pool,
 )
 from v7_cnn_ensemble import (
     CNN_SEEDS,
@@ -68,78 +68,130 @@ from validation import (
 
 SEG_KWARGS = dict(smooth=3, thr_frac=0.7, small_k_cutoff=4, max_seg=60)
 CNN_WEIGHT = 0.35
+MIN_PER_METRIC_SAMPLES = 3000  # below this, fall back to global CNN
+USE_V12_WEIGHTS = True
+IF_DISJOINT = True
+IF_CONSTANT = True
 
 
-def build_hybrid_strong(window_dirs, n_estimators: int, max_depth: int,
-                        min_samples_leaf: int = 3):
-    """Hybrid CW with configurable strength."""
+def build_per_metric_training_pool(window_dirs, metric_type: str
+                                   ) -> tuple[np.ndarray, np.ndarray]:
+    """Same as v6 pool but only windows of a single metric_type."""
+    Xs, ys = [], []
+    for wdir in window_dirs:
+        info = json.loads((wdir / "info.json").read_text())
+        if info.get("metric_type") != metric_type:
+            continue
+        train_y = np.load(wdir / "train_label.npy")
+        if train_y.sum() == 0:
+            continue
+        train_x = np.load(wdir / "train.npy")
+        if len(train_x) < 20:
+            continue
+        Xs.append(v6_build_contexts(train_x))
+        ys.append(train_y.astype(np.float32))
+    if not Xs:
+        return np.zeros((0, 32), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+    X = np.vstack(Xs)
+    y = np.concatenate(ys)
+    if 0 < SUBSAMPLE_NEG < 1.0:
+        rng = np.random.default_rng(SEED)
+        neg_idx = np.where(y == 0)[0]
+        keep_n = int(len(neg_idx) * SUBSAMPLE_NEG)
+        keep_idx = rng.choice(neg_idx, size=keep_n, replace=False)
+        all_idx = np.concatenate([np.where(y == 1)[0], keep_idx])
+        rng.shuffle(all_idx)
+        X = X[all_idx]
+        y = y[all_idx]
+    return X, y
+
+
+def train_cnn_routes(window_dirs):
+    """Train global CNN ensemble + per-metric CNN ensembles for specialized types."""
+    print(">>> Training GLOBAL 3-seed CNN ensemble…")
+    X, y = v6_build_training_pool(window_dirs)
+    print(f"    global pool: X={X.shape}  y.mean={y.mean():.3f}")
+    global_models = []
+    for s in CNN_SEEDS:
+        t0 = time.time()
+        global_models.append(fit_cnn_with_seed(X, y, s))
+        print(f"    global seed={s}  fit {time.time() - t0:.1f}s")
+
+    per_metric_models: dict[str, list] = {}
+    for mt in SPECIALIZED:
+        print(f">>> Training per-metric CNN ensemble for {mt}…")
+        Xm, ym = build_per_metric_training_pool(window_dirs, mt)
+        print(f"    {mt} pool: X={Xm.shape}  y.mean={ym.mean():.3f}")
+        if len(Xm) < MIN_PER_METRIC_SAMPLES:
+            print(f"    SKIP {mt}: only {len(Xm)} samples (< {MIN_PER_METRIC_SAMPLES})")
+            continue
+        models = []
+        for s in CNN_SEEDS:
+            t0 = time.time()
+            models.append(fit_cnn_with_seed(Xm, ym, s))
+            print(f"    {mt} seed={s}  fit {time.time() - t0:.1f}s")
+        per_metric_models[mt] = models
+
+    print(f">>> Per-metric CNN routes built for: {sorted(per_metric_models.keys())}")
+    return global_models, per_metric_models
+
+
+def routed_cnn_score(test_x: np.ndarray, metric_type: str,
+                     global_models, per_metric_models) -> np.ndarray:
+    """Use the per-metric ensemble if available, otherwise global."""
+    if metric_type in per_metric_models:
+        return ensemble_cnn_score(per_metric_models[metric_type], test_x)
+    return ensemble_cnn_score(global_models, test_x)
+
+
+def scores_for_routed(train_x, train_y, test_x, cw, global_models,
+                      per_metric_models, metric_type) -> np.ndarray:
+    """v11 all_v12 weights with the per-metric-routed CNN ensemble."""
+    category = categorize_window(train_x, test_x)
+    cw_s = normalize_scores(cw.predict_proba(test_x, metric_type=metric_type))
+    cnn_s = normalize_scores(routed_cnn_score(test_x, metric_type,
+                                              global_models, per_metric_models))
+
+    if category == "constant_train":
+        if IF_CONSTANT:
+            if_s = normalize_scores(isolation_forest_test(test_x, train_y))
+            if USE_V12_WEIGHTS:
+                return (0.50 - CNN_WEIGHT) * cw_s + 0.50 * if_s + CNN_WEIGHT * cnn_s
+            return 0.40 * cw_s + (0.60 - CNN_WEIGHT) * if_s + CNN_WEIGHT * cnn_s
+        local = normalize_scores(online_ensemble(test_x, window=15))
+        return 0.40 * cw_s + (0.60 - CNN_WEIGHT) * local + CNN_WEIGHT * cnn_s
+    if category == "disjoint":
+        g_s = normalize_scores(global_distance_score(train_x, test_x))
+        if IF_DISJOINT:
+            if_s = normalize_scores(isolation_forest_test(test_x, train_y))
+            if USE_V12_WEIGHTS:
+                return 0.35 * cw_s + 0.30 * g_s + (0.35 - CNN_WEIGHT) * if_s + CNN_WEIGHT * cnn_s
+            return 0.30 * cw_s + 0.30 * g_s + (0.40 - CNN_WEIGHT) * if_s + CNN_WEIGHT * cnn_s
+        local = normalize_scores(online_ensemble(test_x, window=15))
+        return 0.30 * cw_s + 0.30 * g_s + (0.40 - CNN_WEIGHT) * local + CNN_WEIGHT * cnn_s
+    if category == "partial_overlap":
+        pw = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
+        local = normalize_scores(online_ensemble(test_x, window=15))
+        return 0.35 * cw_s + 0.35 * pw + (0.30 - CNN_WEIGHT) * local + CNN_WEIGHT * cnn_s
+    if category == "test_within_train":
+        pw = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
+        return (0.50 - CNN_WEIGHT) * cw_s + 0.50 * pw + CNN_WEIGHT * cnn_s
+    return np.zeros(len(test_x))
+
+
+def build_hybrid_strong(window_dirs):
     g = CrossWindowModel(backend="rf", per_metric=False,
-                         n_estimators=n_estimators, max_depth=max_depth,
-                         min_samples_leaf=min_samples_leaf).fit(window_dirs)
+                         n_estimators=500, max_depth=15).fit(window_dirs)
     p = CrossWindowModel(backend="rf", per_metric=True,
-                         n_estimators=n_estimators, max_depth=max_depth,
-                         min_samples_leaf=min_samples_leaf).fit(window_dirs)
+                         n_estimators=500, max_depth=15).fit(window_dirs)
     return HybridCrossWindowModel(global_model=g, per_metric_model=p,
                                   specialized_types=SPECIALIZED)
 
 
-def scores_for_config(train_x, train_y, test_x, cw, cnn_models, metric_type, *,
-                      if_on_disjoint: bool, if_on_constant: bool,
-                      use_v12_weights: bool) -> np.ndarray:
-    """Compute ensemble scores under a given v11 configuration."""
-    category = categorize_window(train_x, test_x)
-    cw_s = normalize_scores(cw.predict_proba(test_x, metric_type=metric_type))
-    cnn_s = normalize_scores(ensemble_cnn_score(cnn_models, test_x))
-
-    if category == "constant_train":
-        if if_on_constant:
-            if_s = normalize_scores(isolation_forest_test(test_x, train_y))
-            # v12 weights: 0.5 cw + 0.5 if; we additionally fold in the CNN
-            if use_v12_weights:
-                scores = (0.50 - CNN_WEIGHT) * cw_s + 0.50 * if_s + CNN_WEIGHT * cnn_s
-            else:
-                # Substitute IF for online but keep author weights (0.4 cw + 0.6 local)
-                scores = 0.40 * cw_s + (0.60 - CNN_WEIGHT) * if_s + CNN_WEIGHT * cnn_s
-        else:
-            local = normalize_scores(online_ensemble(test_x, window=15))
-            scores = 0.40 * cw_s + (0.60 - CNN_WEIGHT) * local + CNN_WEIGHT * cnn_s
-
-    elif category == "disjoint":
-        g_s = normalize_scores(global_distance_score(train_x, test_x))
-        if if_on_disjoint:
-            if_s = normalize_scores(isolation_forest_test(test_x, train_y))
-            if use_v12_weights:
-                # v12: 0.35 cw + 0.30 global + 0.35 if; fold in CNN by trimming if
-                scores = 0.35 * cw_s + 0.30 * g_s + (0.35 - CNN_WEIGHT) * if_s + CNN_WEIGHT * cnn_s
-            else:
-                # Keep author weights (0.30 / 0.30 / 0.40) but substitute IF for online
-                scores = 0.30 * cw_s + 0.30 * g_s + (0.40 - CNN_WEIGHT) * if_s + CNN_WEIGHT * cnn_s
-        else:
-            local = normalize_scores(online_ensemble(test_x, window=15))
-            scores = 0.30 * cw_s + 0.30 * g_s + (0.40 - CNN_WEIGHT) * local + CNN_WEIGHT * cnn_s
-
-    elif category == "partial_overlap":
-        pw = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
-        local = normalize_scores(online_ensemble(test_x, window=15))
-        scores = 0.35 * cw_s + 0.35 * pw + (0.30 - CNN_WEIGHT) * local + CNN_WEIGHT * cnn_s
-
-    elif category == "test_within_train":
-        pw = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
-        scores = (0.50 - CNN_WEIGHT) * cw_s + 0.50 * pw + CNN_WEIGHT * cnn_s
-    else:
-        scores = np.zeros(len(test_x))
-    return scores
-
-
-CONFIGS = [
-    # name              if_disj   if_const  v12_w
-    ("base",            False,    False,    False),
-    ("stronger_cw",     False,    False,    False),   # special: bigger CW
-    ("if_disjoint",     True,     False,    False),
-    ("if_both",         True,     True,     False),
-    ("v12_weights",     False,    False,    True),    # weights only, no IF
-    ("all_v12",         True,     True,     True),    # full v12 + CNN + segments
-]
+def scores_for_global(train_x, train_y, test_x, cw, global_models, metric_type):
+    """v11 all_v12 baseline (global CNN ensemble, no routing)."""
+    return scores_for_routed(train_x, train_y, test_x, cw, global_models, {},
+                             metric_type)
 
 
 def run_validation(seed: int = 42) -> dict:
@@ -147,86 +199,54 @@ def run_validation(seed: int = 42) -> dict:
     train_pool, holdout = stratified_holdout(all_window_dirs(), frac=0.10, seed=seed)
     print(f"    train_pool={len(train_pool)}  holdout={len(holdout)}")
 
-    print(">>> Training BASELINE hybrid CW (200/12/3)…")
+    print(">>> Training stronger hybrid CW (500/15/3)…")
     t0 = time.time()
-    cw_base = build_hybrid_strong(train_pool, n_estimators=200, max_depth=12)
+    cw = build_hybrid_strong(train_pool)
     print(f"    fit {time.time() - t0:.1f}s")
 
-    print(">>> Training STRONGER hybrid CW (500/15/3)…")
-    t0 = time.time()
-    cw_strong = build_hybrid_strong(train_pool, n_estimators=500, max_depth=15)
-    print(f"    fit {time.time() - t0:.1f}s")
+    global_models, per_metric_models = train_cnn_routes(train_pool)
 
-    print(">>> Building CNN pool + training 3 CNNs…")
-    X, y = build_training_pool(train_pool)
-    print(f"    pool X.shape={X.shape}  y.mean={y.mean():.3f}")
-    cnn_models = []
-    for s in CNN_SEEDS:
-        t0 = time.time()
-        cnn_models.append(fit_cnn_with_seed(X, y, s))
-        print(f"    cnn seed={s}  fit {time.time() - t0:.1f}s")
+    def pred_baseline(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
+        scores = scores_for_global(sub_tr_x, sub_tr_y, sub_te_x, cw, global_models,
+                                   info.get("metric_type", "ALL"))
+        return predict_segments(scores, int(round(len(sub_te_x) * ratio)), **SEG_KWARGS)
 
-    print(f"\n>>> Running {len(CONFIGS)} configurations…")
-    results = {}
-    for name, if_d, if_c, v12_w in CONFIGS:
-        cw = cw_strong if name in ("stronger_cw", "all_v12") else cw_base
+    def pred_routed(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
+        scores = scores_for_routed(sub_tr_x, sub_tr_y, sub_te_x, cw,
+                                   global_models, per_metric_models,
+                                   info.get("metric_type", "ALL"))
+        return predict_segments(scores, int(round(len(sub_te_x) * ratio)), **SEG_KWARGS)
 
-        def predictor(sub_tr_x, sub_tr_y, sub_te_x, info, ratio,
-                      _cw=cw, _if_d=if_d, _if_c=if_c, _v12_w=v12_w):
-            scores = scores_for_config(
-                sub_tr_x, sub_tr_y, sub_te_x, _cw, cnn_models,
-                info.get("metric_type", "ALL"),
-                if_on_disjoint=_if_d, if_on_constant=_if_c, use_v12_weights=_v12_w,
-            )
-            return predict_segments(scores, int(round(len(sub_te_x) * ratio)), **SEG_KWARGS)
+    print("\n>>> Eval: v11 all_v12 baseline (global CNN)…")
+    rep_base = evaluate(pred_baseline, holdout)
+    print_summary(rep_base, name="v11 all_v12 baseline")
 
-        print(f"\n>>> [{name}]")
-        rep = evaluate(predictor, holdout)
-        print_summary(rep, name=name)
-        results[name] = rep
+    print(">>> Eval: v12 per-metric CNN routing…")
+    rep_routed = evaluate(pred_routed, holdout)
+    print_summary(rep_routed, name="v12 per-metric CNN routed")
 
-    print("\n──────  ablation summary ──────")
-    base_f1 = results["base"]["overall_f1"]
-    rows = sorted(results.items(), key=lambda kv: -kv[1]["overall_f1"])
-    for name, rep in rows:
-        d = rep["overall_f1"] - base_f1
-        print(f"  {name:<14}  F1={rep['overall_f1']:.4f}  Δ_vs_base={d:+.4f}")
-
-    winner_name, winner_rep = rows[0]
-    print(f"\n  Winner: {winner_name}  F1={winner_rep['overall_f1']:.4f}")
+    delta = rep_routed["overall_f1"] - rep_base["overall_f1"]
+    print(f"\n  Δ (routed − baseline) = {delta:+.4f}")
 
     report = {
-        "configs": {name: r["overall_f1"] for name, r in results.items()},
-        "per_config_per_window": {name: r["per_window"] for name, r in results.items()},
-        "winner": winner_name,
-        "delta_winner_vs_base": winner_rep["overall_f1"] - base_f1,
+        "baseline": rep_base,
+        "routed": rep_routed,
+        "delta_routed_vs_baseline": delta,
+        "specialized_metrics_actually_routed": sorted(per_metric_models.keys()),
         "seed": seed,
         "n_holdout": len(holdout),
     }
-    save_report(report, "v11_kimi_v12_ablation")
+    save_report(report, "v12_per_metric_cnn")
     return report
 
 
-def generate_submission(config_name: str,
-                        output: Path = Path("submission_kimi_combo.json")) -> Path:
-    cfg = next(c for c in CONFIGS if c[0] == config_name)
-    name, if_d, if_c, v12_w = cfg
-
-    print(f"\n>>> Training hybrid CW on ALL 1000 windows…")
+def generate_submission(output: Path = Path("submission_per_metric_cnn.json")) -> Path:
+    print("\n>>> Training stronger hybrid CW on ALL 1000 windows…")
     t0 = time.time()
-    if name in ("stronger_cw", "all_v12"):
-        cw = build_hybrid_strong(all_window_dirs(), n_estimators=500, max_depth=15)
-    else:
-        cw = build_hybrid_strong(all_window_dirs(), n_estimators=200, max_depth=12)
+    cw = build_hybrid_strong(all_window_dirs())
     print(f"    fit {time.time() - t0:.1f}s")
 
-    print(">>> Building full CNN pool + 3 CNNs…")
-    X, y = build_training_pool(all_window_dirs())
-    cnn_models = []
-    for s in CNN_SEEDS:
-        t0 = time.time()
-        cnn_models.append(fit_cnn_with_seed(X, y, s))
-        print(f"    cnn seed={s}  fit {time.time() - t0:.1f}s")
+    global_models, per_metric_models = train_cnn_routes(all_window_dirs())
 
     print(">>> Generating predictions…")
     preds: dict[str, list[int]] = {}
@@ -234,10 +254,8 @@ def generate_submission(config_name: str,
     for i, wdir in enumerate(all_window_dirs(), 1):
         w = load_window(wdir)
         test_ratio = float(w.info.get("test set anomaly ratio", 0.0))
-        scores = scores_for_config(
-            w.train_x, w.train_y, w.test_x, cw, cnn_models, w.metric_type,
-            if_on_disjoint=if_d, if_on_constant=if_c, use_v12_weights=v12_w,
-        )
+        scores = scores_for_routed(w.train_x, w.train_y, w.test_x, cw,
+                                   global_models, per_metric_models, w.metric_type)
         k = int(round(len(w.test_x) * test_ratio))
         preds[w.wid] = predict_segments(scores, k, **SEG_KWARGS).astype(int).tolist()
         if i % 100 == 0:
@@ -254,11 +272,10 @@ def generate_submission(config_name: str,
 
 if __name__ == "__main__":
     rep = run_validation()
-    if rep["winner"] != "base" and rep["delta_winner_vs_base"] > 0.001:
-        out_name = f"submission_kimi_combo_{rep['winner']}.json"
-        print(f"\nWinner {rep['winner']} beats base by {rep['delta_winner_vs_base']:+.4f}; "
-              f"generating {out_name}…")
-        generate_submission(rep["winner"], output=Path(out_name))
+    if rep["delta_routed_vs_baseline"] > 0.002:
+        print(f"\nRouted CNN beats baseline by {rep['delta_routed_vs_baseline']:+.4f}; "
+              "generating submission.")
+        generate_submission()
     else:
-        print(f"\nNo v12 change improved on the current author pipeline. "
-              "submission NOT generated.")
+        print(f"\nPer-metric CNN routing did not meaningfully help "
+              f"(Δ = {rep['delta_routed_vs_baseline']:+.4f}); submission NOT generated.")
