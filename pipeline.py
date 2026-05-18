@@ -1,24 +1,10 @@
 """
-author v43 — two-pipeline blend: P1 (standard, v40) + P2 (shift-detection).
+author v44 — W_SHIFT=0.20: same as v43 but less P2 influence.
 
-APPROACH.md metric_pooled_v8 pattern: blend a standard pipeline with a second
-model trained on temporal splits so shift features have real variance during
-training. Friend jumped from 0.6453 → 0.66 with this approach.
+Hypothesis: if P2 is noisy, reducing its weight 0.30→0.20 improves LB.
+v43 baseline: 0.6561 LB (W_SHIFT=0.30).
 
-P1 (68 features, v40-identical):
-  Trained on full train_x per window.
-
-P2 (75 features = 68 + 7 shift):
-  Trained on LAST 30% of each window's train_x, using the FIRST 70% as the
-  reference. This makes shift features (above_ref_max, mean_shift, etc.)
-  non-zero during training — the model learns train→test regime shifts.
-  7 shift features: rank_in_self, self_robust_z, above_ref_max, below_ref_min,
-  mean_shift_broadcast, std_ratio_broadcast, median_shift_broadcast.
-
-Blend: prob = (1 - W_SHIFT) * prob_P1 + W_SHIFT * prob_P2
-Then: same smooth(5, 0.8) + top-k as v40.
-
-Run:  uv run python v43_shift_pipeline.py
+Run:  uv run python v44_wshift20.py
 """
 
 from __future__ import annotations
@@ -49,7 +35,7 @@ METRIC_TYPES = ("Count", "ErrorCount", "LatencySecond", "QPS",
 TOP_K_SERVICES = 30
 SMOOTH_W = 5
 SMOOTH_ALPHA = 0.8
-W_SHIFT = 0.30          # blend weight for P2 shift model
+W_SHIFT = 0.20          # blend weight for P2 shift model
 SPLIT_FRAC = 0.70       # fraction of train_x used as "reference" for P2 training
 N_FEATS_P1 = 68
 N_FEATS_P2 = 75         # 68 + 7 shift features
@@ -498,10 +484,10 @@ def run_validation(seed: int = 42):
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v43 shift-pipeline (CW-LOO)")
+    print_summary_v2(rep, "v44 W_SHIFT=0.20 (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v43_shift_pipeline_loo")
+    save_report(rep, "v44_wshift20_loo")
     return rep, ensembles, top_services
 
 
@@ -539,4 +525,5 @@ if __name__ == "__main__":
     top_services_full = compute_top_services(all_window_dirs(), k=TOP_K_SERVICES)
     ensembles_full = fit_both_ensembles(all_window_dirs(), top_services_full)
     print(f"    full fit {time.time() - t0:.1f}s")
-    generate_submission(ensembles_full, top_services_full)
+    generate_submission(ensembles_full, top_services_full,
+                        output=Path("submission_v44_wshift20.json"))
