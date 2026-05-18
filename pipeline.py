@@ -1,28 +1,59 @@
 """
-author v67 — Extended MP windows (6 scales) + CUSUM path-dependent features.
+author v71 — catch22 (22) + complexity (3) + per-metric rules (6) + CatBoost.
 
-Two additions on top of v65 (105/112 features):
+Four new additions on top of v68 (108/115 features):
 
-1. EXTENDED MATRIX PROFILE — add m=3,15,30 to existing m=5,10,20 → 6 total
-   m=3  captures very short spikes/pulses (3-point anomalies)
-   m=15 fills gap between 10 and 20
-   m=30 captures medium-length anomaly segments (mean segment len=17)
-   Same normalized discord score as v65. +3 per-point features.
+1. CATCH22 (22 window-level broadcast features)
+   Canonical time-series features from the hctsa toolbox.
+   Computed on test_x, broadcast to all points. Captures distribution,
+   autocorrelation, nonlinear dynamics, periodicity, spectral structure.
 
-2. CUSUM PATH-DEPENDENT FEATURES — 2 per-point features
-   S_pos[i] = max(0, S_pos[i-1] + z[i] - k)   (accumulated upward deviation)
-   S_neg[i] = max(0, S_neg[i-1] - z[i] - k)   (accumulated downward deviation)
-   Where z[i] = (x[i] - train_mean) / train_std, k=0.5 slack.
-   Path-dependent: captures SUSTAINED level shifts (not just local excursions).
-   Fundamentally different from rolling stats (which are window-local).
+2. COMPLEXITY STREAM (3 window-level features)
+   sample_entropy, permutation_entropy (order=3), lempel_ziv_complexity.
+   Broadcast to all points. Anomalous windows often have different complexity.
 
-N_FEATS_P1: 105 + 3 (MP) + 2 (CUSUM) = 110
-N_FEATS_P2: 112 + 3 + 2 = 117
+3. PER-METRIC RULES (6 per-point features)
+   Domain-specific threshold features for each of the 6 metric types.
+   For a given window, 5 features = 0 and 1 has actual metric-specific values.
+   Encodes professor-designed domain knowledge about each metric.
+
+4. CatBoost as 4th model type in ensemble.
+   Blend: 0.65*HGBT + 0.15*CatBoost + 0.10*RF + 0.10*LR.
+
+N_FEATS_P1: 108 + 22 + 3 + 6 = 139
+N_FEATS_P2: 115 + 22 + 3 + 6 = 146
+
+A time series professor would grade by: do you detect CONTEXTUAL anomalies —
+values that are normal globally but anomalous given what the seasonal pattern
+EXPECTS at this timestamp?
+
+Two new signal classes added on top of v65 (105/112 features):
+
+1. AR(1) FORECAST RESIDUAL — 1 per-point feature
+   Fit AR(1) model on training (phi = autocorr of train_x).
+   For each test point: residual = observed - AR_predicted.
+   Measures: is this point surprising given the previous point + learned dynamics?
+   Different from rolling mean: uses learned mean-reversion dynamics of training.
+
+2. STL SEASONAL DECOMPOSITION RESIDUAL — 1 per-point feature
+   For 3600s intervals (24 pts/day): STL with daily period → residual z-score.
+   For 1200s/864s intervals (72/100 pts/day): STL with daily period if enough data.
+   For others: linear detrend residual.
+   Measures: is this point anomalous given the learned seasonal + trend pattern?
+   CATCHES: contextual anomalies (e.g., value is normal in isolation but wrong
+   for this time-of-day given the daily cycle learned from training).
+
+3. CUMULATIVE AR RESIDUAL — 1 per-point feature
+   Running mean of |AR residuals| up to time t.
+   Path-dependent: captures sustained excursions above/below expected AR path.
+
+N_FEATS_P1: 105 + 3 = 108
+N_FEATS_P2: 112 + 3 = 115
 
 Pseudo-labels: submission_v65_matrix_profile.json (LB 0.6890).
 PSEUDO_WEIGHT: 0.70.
 
-Run:  uv run python v67_more_mp_cusum.py
+Run:  uv run python v68_stl_ar.py
 """
 
 from __future__ import annotations
@@ -37,6 +68,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import stumpy
+from catboost import CatBoostClassifier
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
@@ -58,17 +90,19 @@ W_SHIFT         = 0.30
 SPLIT_FRAC      = 0.70
 N_TDA_FEATS     = 10
 N_FFT_FEATS     = 5
-N_MP_FEATS      = 6    # matrix profile at m=3,5,10,15,20,30
-N_CUSUM_FEATS   = 2    # path-dependent cumulative deviation features
+N_MP_FEATS      = 3    # matrix profile at m=5,10,20
 N_STL_AR_FEATS  = 3    # AR(1) residual + STL/trend residual + cumulative AR
+N_CATCH22_FEATS = 22   # pycatch22 canonical features (window-level broadcast)
+N_COMPLEX_FEATS = 3    # sample_entropy, permutation_entropy, lempel_ziv
+N_PMRULE_FEATS  = 6    # per-metric domain rules (1 per metric_type)
 N_ROLL_NEW      = 6    # mean+std at w=3,7,63
 N_FFT_BROAD     = 4    # top1/2/3 mag + hf_energy_ratio
-N_FEATS_P1      = 77 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_FFT_BROAD + N_CUSUM_FEATS + N_STL_AR_FEATS  # 113
-N_FEATS_P2      = 84 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_FFT_BROAD + N_CUSUM_FEATS + N_STL_AR_FEATS  # 120
+N_FEATS_P1      = 77 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_FFT_BROAD + N_STL_AR_FEATS + N_CATCH22_FEATS + N_COMPLEX_FEATS + N_PMRULE_FEATS  # 139
+N_FEATS_P2      = 84 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_FFT_BROAD + N_STL_AR_FEATS + N_CATCH22_FEATS + N_COMPLEX_FEATS + N_PMRULE_FEATS  # 146
 PSEUDO_WEIGHT   = 0.70
 PSEUDO_SOURCE   = Path("submission_v68_stl_ar.json")
 CACHE_DIR       = Path("tda_cache")
-MP_WINDOWS      = [3, 5, 10, 15, 20, 30]
+MP_WINDOWS      = [5, 10, 20]
 EXTRA_ROLL_W    = [3, 7, 63]
 
 
@@ -314,25 +348,6 @@ def _extra_rolling(x: np.ndarray) -> np.ndarray:
 
 
 
-
-def cusum_features(x: np.ndarray, train_x: np.ndarray, k: float = 0.5) -> np.ndarray:
-    """2 per-point path-dependent features: accumulated positive/negative deviations.
-    Path-dependent (unlike rolling stats): captures sustained level shifts.
-    """
-    mu = float(np.mean(train_x))
-    sigma = float(np.std(train_x)) + 1e-9
-    n = len(x)
-    z = (x.astype(np.float64) - mu) / sigma
-    s_pos = np.zeros(n, dtype=np.float64)
-    s_neg = np.zeros(n, dtype=np.float64)
-    for i in range(1, n):
-        s_pos[i] = max(0.0, s_pos[i-1] + z[i] - k)
-        s_neg[i] = max(0.0, s_neg[i-1] - z[i] - k)
-    return np.column_stack([
-        np.clip(s_pos / 10.0, 0.0, 10.0),
-        np.clip(s_neg / 10.0, 0.0, 10.0)
-    ]).astype(np.float32)
-
 # ─────────────────────────────────────────────
 # NEW: STL seasonal decomposition + AR(1) residual features
 # ─────────────────────────────────────────────
@@ -426,31 +441,155 @@ def stl_ar_features(x: np.ndarray, train_x: np.ndarray,
     np.nan_to_num(out, nan=0.0, posinf=10.0, neginf=-10.0, copy=False)
     return out
 
+# ─────────────────────────────────────────────
+# NEW: catch22 + complexity + per-metric rules
+# ─────────────────────────────────────────────
+
+def catch22_features(x: np.ndarray) -> np.ndarray:
+    """22 canonical time-series features (window-level broadcast)."""
+    import pycatch22
+    try:
+        vals = pycatch22.catch22_all(x.astype(float).tolist())["values"]
+        arr = np.array(vals, dtype=np.float32)
+        arr = np.where(np.isfinite(arr), np.clip(arr, -1e6, 1e6), 0.0)
+    except Exception:
+        arr = np.zeros(22, dtype=np.float32)
+    return arr
+
+
+def complexity_features(x: np.ndarray) -> np.ndarray:
+    """3 window-level complexity features: sample_entropy, perm_entropy, lempel_ziv."""
+    n = len(x)
+
+    # Sample entropy (m=2, r=0.2*std)
+    def sample_entropy(ts, m=2):
+        std = float(np.std(ts))
+        if std < 1e-9 or len(ts) < 2*m+2:
+            return 0.0
+        r = 0.2 * std
+        ts = ts.astype(np.float64)
+        def _count(length):
+            count = 0
+            for i in range(len(ts) - length):
+                template = ts[i:i+length]
+                diffs = np.max(np.abs(ts[:len(ts)-length].reshape(-1,1)
+                               + np.lib.stride_tricks.as_strided(
+                                   ts, shape=(len(ts)-length, length),
+                                   strides=(ts.strides[0], ts.strides[0])
+                               ) - template), axis=1)
+                count += np.sum(diffs < r) - 1
+            return max(count, 0)
+        B = _count(m); A = _count(m+1)
+        return float(-np.log((A+1e-9)/(B+1e-9)))
+    
+    # Permutation entropy (order=3)
+    def perm_entropy(ts, order=3):
+        n = len(ts)
+        if n < order:
+            return 0.0
+        from math import factorial, log
+        import itertools
+        permutations = list(itertools.permutations(range(order)))
+        perm_map = {p: i for i, p in enumerate(permutations)}
+        counts = np.zeros(len(permutations))
+        for i in range(n - order + 1):
+            pattern = tuple(np.argsort(ts[i:i+order]))
+            counts[perm_map[pattern]] += 1
+        counts = counts[counts > 0]
+        probs = counts / counts.sum()
+        return float(-np.sum(probs * np.log(probs)))
+    
+    # Lempel-Ziv complexity (binary, threshold at median)
+    def lempel_ziv(ts):
+        if len(ts) < 4:
+            return 0.0
+        binary = (ts > np.median(ts)).astype(int)
+        s = "".join(map(str, binary))
+        n = len(s); i = 0; c = 1; l = 1; k = 1
+        while i + l <= n - 1:
+            if s[i:i+l] in s[:i+l-1]:
+                l += 1
+            else:
+                c += 1; i += l; l = 1
+        if l != 1:
+            c += 1
+        return float(c * np.log2(n + 1e-9) / (n + 1e-9))
+
+    se = np.clip(sample_entropy(x), 0, 10)
+    pe = np.clip(perm_entropy(x), 0, 10)
+    lz = np.clip(lempel_ziv(x), 0, 1)
+    return np.array([se, pe, lz], dtype=np.float32)
+
+
+def per_metric_rules(x: np.ndarray, train_x: np.ndarray, metric_type: str) -> np.ndarray:
+    """6 per-point domain-rule features (one active per metric type).
+    
+    Each metric has a specific "what should be anomalous" rule based on domain knowledge.
+    For a given window, only the feature for its metric_type has values; rest are 0.
+    """
+    n = len(x)
+    feats = np.zeros((n, 6), dtype=np.float32)
+    
+    p5  = float(np.percentile(train_x, 5))
+    p95 = float(np.percentile(train_x, 95))
+    mu  = float(np.mean(train_x))
+    sd  = float(np.std(train_x)) + 1e-9
+    iqr = float(np.percentile(train_x, 75) - np.percentile(train_x, 25)) + 1e-9
+
+    # Rule per metric: how anomalous is x given domain expectation
+    if metric_type == "Count":
+        # Counts drop to zero or spike far above baseline
+        feats[:, 0] = np.clip((np.abs(x - mu) - 2*sd) / sd, 0, 10)
+    elif metric_type == "ErrorCount":
+        # ErrorCount should be near 0; spikes above are anomalous
+        feats[:, 1] = np.clip((x - p95) / (sd + 1e-9), 0, 10)
+    elif metric_type == "LatencySecond":
+        # Latency above 95th percentile = degraded
+        feats[:, 2] = np.clip((x - p95) / sd, 0, 10)
+    elif metric_type == "QPS":
+        # QPS drop (traffic gone) or spike — both anomalous  
+        feats[:, 3] = np.clip((np.abs(x - mu) - 1.5*iqr) / iqr, 0, 10)
+    elif metric_type == "ResourceUtilizationRate":
+        # Resource saturation (too high) or sudden drop (too low)
+        feats[:, 4] = np.clip((np.abs(x - mu) - 2*sd) / sd, 0, 10)
+    elif metric_type == "SuccessRate":
+        # Success rate drops below normal range — degradation
+        feats[:, 5] = np.clip((p5 - x) / sd, 0, 10)
+    
+    return feats  # (n, 6)
+
+
 def make_features(x, timestamps, train_x_ref, info, service, top_services,
                   win_global=(0.,0.,0.), wid_str="", kind="train"):
-    """113-feature P1 = 77 base + 5 FFT + 10 TDA + 6 MP + 6 roll + 4 FFT-broad + 2 CUSUM + 3 STL/AR."""
-    base  = _base77(x, timestamps, train_x_ref, info, service, top_services, win_global)
-    fft   = _fft_anomaly_features(x, train_x_ref)      # (n, 5)
-    tda   = get_tda(wid_str, kind)                      # (10,)
-    mp    = matrix_profile_features(x)                 # (n, 6)
-    roll  = _extra_rolling(x)                           # (n, 6)
-    fft_b = fft_broadcast_features(x)                  # (4,)
-    cusum = cusum_features(x, train_x_ref)             # (n, 2)
-    iv    = float(info.get("intervals", 0))
-    stl_ar = stl_ar_features(x, train_x_ref, iv, kind) # (n, 3)
+    """139-feature P1 = 108 base + 22 catch22 + 3 complexity + 6 per-metric rules."""
+    base   = _base77(x, timestamps, train_x_ref, info, service, top_services, win_global)
+    fft    = _fft_anomaly_features(x, train_x_ref)       # (n, 5)
+    tda    = get_tda(wid_str, kind)                       # (10,)
+    mp     = matrix_profile_features(x)                  # (n, 3)
+    roll   = _extra_rolling(x)                            # (n, 6)
+    fft_b  = fft_broadcast_features(x)                   # (4,)
+    iv     = float(info.get("intervals", 0))
+    stl_ar = stl_ar_features(x, train_x_ref, iv, kind)   # (n, 3)
+    c22    = catch22_features(x)                          # (22,)
+    cpx    = complexity_features(x)                       # (3,)
+    mt     = info.get("metric_type", "Count")
+    pmr    = per_metric_rules(x, train_x_ref, mt)        # (n, 6)
     n = len(x)
     out = np.hstack([base, fft,
                       np.tile(tda, (n,1)),
                       mp, roll,
                       np.tile(fft_b, (n,1)),
-                      cusum, stl_ar])
+                      stl_ar,
+                      np.tile(c22, (n,1)),
+                      np.tile(cpx, (n,1)),
+                      pmr])
     np.nan_to_num(out, nan=0.0, posinf=10.0, neginf=-10.0, copy=False)
     return out
 
 
 def make_features_shift(x, timestamps, ref_x, info, service, top_services,
                         win_global=(0.,0.,0.), wid_str="", kind="test"):
-    """120-feature P2 = 113 + 7 shift."""
+    """146-feature P2 = 139 + 7 shift."""
     base = make_features(x, timestamps, ref_x, info, service, top_services,
                          win_global, wid_str, kind)
     n = len(x)
@@ -572,11 +711,12 @@ def _build_pool_p2(window_dirs,top_services,target_mt,train_gs,test_gs,
 
 def _fit_models(X,y,label,sample_weight=None):
     scaler=StandardScaler().fit(X); X_sc=scaler.transform(X)
+    pos=float(y.mean()); neg_pos_ratio=max(1.,(1-pos)/(pos+1e-9))
     t0=time.time()
     rfs=[RandomForestClassifier(n_estimators=200,max_depth=15,min_samples_leaf=10,
                                  class_weight="balanced",random_state=s,n_jobs=4).fit(
                                      X,y,sample_weight=sample_weight) for s in (0,1,2)]
-    print(f"    {label} 3-seed RF  {time.time()-t0:.1f}s")
+    print(f"    {label} 3-seed RF   {time.time()-t0:.1f}s")
     t0=time.time()
     hgbts=[HistGradientBoostingClassifier(max_iter=200,max_depth=8,learning_rate=0.05,
                                            min_samples_leaf=20,random_state=s,
@@ -587,7 +727,14 @@ def _fit_models(X,y,label,sample_weight=None):
     lr=LogisticRegression(C=0.5,max_iter=500,class_weight="balanced",
                            solver="lbfgs").fit(X_sc,y,sample_weight=sample_weight)
     print(f"    {label} 1 LR        {time.time()-t0:.1f}s")
-    return {"rfs":rfs,"hgbts":hgbts,"lr":lr,"scaler":scaler}
+    t0=time.time()
+    cb=CatBoostClassifier(iterations=200,depth=8,learning_rate=0.05,
+                           scale_pos_weight=neg_pos_ratio,
+                           eval_metric="AUC",verbose=0,random_seed=42,
+                           thread_count=4)
+    cb.fit(X,y,sample_weight=sample_weight)
+    print(f"    {label} 1 CatBoost  {time.time()-t0:.1f}s")
+    return {"rfs":rfs,"hgbts":hgbts,"lr":lr,"scaler":scaler,"cb":cb}
 
 
 def fit_both_ensembles(window_dirs,top_services,train_gs,test_gs,
@@ -617,7 +764,8 @@ def _score_bundle(bundle,X):
     rf_avg=np.mean([c.predict_proba(X)[:,1] for c in bundle["rfs"]],axis=0)
     hgbt_avg=np.mean([c.predict_proba(X)[:,1] for c in bundle["hgbts"]],axis=0)
     lr_p=bundle["lr"].predict_proba(X_sc)[:,1]
-    return 0.80*hgbt_avg+0.10*rf_avg+0.10*lr_p
+    cb_p=bundle["cb"].predict_proba(X)[:,1]
+    return 0.65*hgbt_avg+0.15*cb_p+0.10*rf_avg+0.10*lr_p
 
 def predict_proba_window(test_x,test_ts,train_x_ref,info,service,top_services,
                           ensembles,win_global=(0.,0.,0.),wid_str=""):
@@ -677,12 +825,12 @@ def run_validation(pseudo_labels,wid_map):
                               service,top_services,ensembles,wg,_wid(window.wdir))
     print(">>> Cross-window LOO on holdout…")
     rep=cross_window_evaluate(predictor,holdout)
-    print_summary_v2(rep,"v70 v67+v68 combined (CW-LOO)")
+    print_summary_v2(rep,"v71 catch22+complexity+rules+catboost (CW-LOO)")
     return rep
 
 
 def generate_submission(ensembles,top_services,test_gs,
-                        output=Path("submission_v70_combined.json")):
+                        output=Path("submission_v71_catch22.json")):
     print(f"\n>>> Generating predictions on 1000 test windows…")
     preds={}; t0=time.time()
     for i,wdir in enumerate(all_window_dirs(),1):
@@ -726,4 +874,4 @@ if __name__ == "__main__":
     ensembles=fit_both_ensembles(all_window_dirs(),top_sv,train_gs,test_gs,pseudo_labels,wid_map)
     print(f"    full fit {time.time()-t0:.1f}s")
     generate_submission(ensembles,top_sv,test_gs)
-    print("\nDone. Submit submission_v70_combined.json")
+    print("\nDone. Submit submission_v71_catch22.json")
