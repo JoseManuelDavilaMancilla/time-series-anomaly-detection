@@ -1,13 +1,22 @@
 """
-author v50 — extended rolling min/max features.
+author v51 — transductive pseudo-labeling.
 
-v43 only had rolling min/max at w=11. friend's features.py lists rolling_min/max
-at all windows. Adding deviations from local min/max at w=5, 21, 41 too.
-(rmax_w - x) and (x - rmin_w) for w in {5, 21, 41} → +6 point features.
+Strategy: use v43 binary predictions (submission_v43_shift_pipeline.json, 0.6561 LB)
+as pseudo-labels for the 1000 test windows, then add those pseudo-labeled test windows
+to BOTH the P1 and P2 training pools before retraining.
 
-P1: 74 features (was 68). P2: 81 features (was 75). Otherwise identical to v43.
+Why it helps: the model currently trains only on train_x distributions. test_x has a
+systematically different distribution (train→test shift). Adding pseudo-labeled test_x
+adapts the model to the test domain without any extra labels.
 
-Run:  uv run python v50_more_minmax.py
+  P1 pseudo: make_features(test_x, test_ts, train_x) + pseudo_y  (matches inference)
+  P2 pseudo: make_features_shift(test_x, test_ts, train_x[:70%]) + pseudo_y
+             (ref_x = first 70% of train_x — consistent with P2 training)
+
+Sample weight: true labeled points = 1.0, pseudo-labeled points = PSEUDO_WEIGHT.
+Windows where pseudo_y.sum()==0 are skipped (no predicted anomalies).
+
+Run:  uv run python v51_pseudo_label.py
 """
 
 from __future__ import annotations
@@ -38,14 +47,16 @@ METRIC_TYPES = ("Count", "ErrorCount", "LatencySecond", "QPS",
 TOP_K_SERVICES = 30
 SMOOTH_W = 5
 SMOOTH_ALPHA = 0.8
-W_SHIFT = 0.30          # blend weight for P2 shift model
-SPLIT_FRAC = 0.70       # fraction of train_x used as "reference" for P2 training
-N_FEATS_P1 = 74          # 68 + 6 extra rolling min/max deviations
-N_FEATS_P2 = 81          # 74 + 7 shift features
+W_SHIFT = 0.30
+SPLIT_FRAC = 0.70
+N_FEATS_P1 = 68
+N_FEATS_P2 = 75
+PSEUDO_WEIGHT = 0.30    # sample weight for pseudo-labeled test windows
+PSEUDO_SOURCE = Path("submission_v43_shift_pipeline.json")
 
 
 # ─────────────────────────────────────────────
-# Rolling helpers — all centered
+# Rolling helpers — all centered (identical to v43)
 # ─────────────────────────────────────────────
 
 def _rolling_mean_std(x: np.ndarray, w: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -120,14 +131,14 @@ def parse_service(case_name: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# Feature builders
+# Feature builders (identical to v43)
 # ─────────────────────────────────────────────
 
 def make_features(
     x: np.ndarray, timestamps: np.ndarray, train_x_ref: np.ndarray,
     info: dict, service: str, top_services: List[str],
 ) -> np.ndarray:
-    """68-feature matrix (P1). Identical to v40."""
+    """68-feature matrix (P1). Identical to v43."""
     n = len(x)
     feats = []
 
@@ -178,12 +189,6 @@ def make_features(
     feats.append(rmax11 - x)
     feats.append(x - rmin11)
 
-    # Extended rolling min/max deviations at w=5, 21, 41
-    for w_mm in (5, 21, 41):
-        rmin_w, rmax_w = _rolling_minmax(x, w_mm)
-        feats.append(rmax_w - x)
-        feats.append(x - rmin_w)
-
     static = []
     mt = info.get("metric_type", "Unknown")
     for m in METRIC_TYPES:
@@ -205,29 +210,12 @@ def make_features_shift(
     x: np.ndarray, timestamps: np.ndarray, ref_x: np.ndarray,
     info: dict, service: str, top_services: List[str],
 ) -> np.ndarray:
-    """75-feature matrix (P2) = 68 standard + 7 shift features.
-
-    Shift features capture how x's distribution differs from ref_x:
-    - rank_in_self: percentile rank within x itself (vs training: within train_x)
-    - self_robust_z: z-score using x's own median/MAD
-    - above_ref_max: how far each point exceeds max(ref_x)
-    - below_ref_min: how far each point falls below min(ref_x)
-    - mean_shift_bc: mean(x) - mean(ref_x), broadcast to all points
-    - std_ratio_bc:  std(x) / (std(ref_x) + eps), broadcast
-    - median_shift_bc: median(x) - median(ref_x), broadcast
-
-    During P2 training (x = last 30%, ref_x = first 70%):
-      shift features are non-trivial → model learns regime-shift patterns.
-    At inference (x = test_x, ref_x = train_x):
-      shift features capture actual train→test distribution changes.
-    """
+    """75-feature matrix (P2) = 68 standard + 7 shift features."""
     base = make_features(x, timestamps, ref_x, info, service, top_services)
     n = len(x)
 
-    # shift features
     x_med = float(np.median(x))
     x_mad = float(np.median(np.abs(x - x_med))) + 1e-9
-    ref_med = float(np.median(ref_x))
     ref_std = float(np.std(ref_x)) + 1e-9
 
     rank_in_self = _percentile_rank_vs(x, x)
@@ -236,7 +224,7 @@ def make_features_shift(
     below_ref_min = np.maximum(0.0, float(np.min(ref_x)) - x)
     mean_shift_bc = np.full(n, float(np.mean(x)) - float(np.mean(ref_x)))
     std_ratio_bc = np.full(n, float(np.std(x)) / ref_std)
-    median_shift_bc = np.full(n, float(np.median(x)) - ref_med)
+    median_shift_bc = np.full(n, float(np.median(x)) - float(np.median(ref_x)))
 
     shift_feats = np.column_stack([
         rank_in_self, self_robust_z, above_ref_max, below_ref_min,
@@ -259,12 +247,41 @@ def compute_top_services(window_dirs, k: int = TOP_K_SERVICES) -> List[str]:
 
 
 # ─────────────────────────────────────────────
-# Training pool builders
+# Pseudo-label helpers
 # ─────────────────────────────────────────────
 
-def _build_pool_p1(window_dirs, top_services, target_mt):
-    """P1 pool: full train_x, 68 features."""
-    Xs, ys = [], []
+def load_pseudo_labels(path: Path) -> Dict[str, np.ndarray]:
+    """Load binary predictions from a submission JSON as pseudo-labels."""
+    data = json.loads(path.read_text())
+    return {wid: np.array(v, dtype=np.int64)
+            for wid, v in data["predictions"].items()}
+
+
+def build_wid_map(window_dirs) -> Dict[str, Path]:
+    """Map wid (3-digit prefix) to wdir."""
+    return {wdir.name.split("_", 1)[0]: wdir for wdir in window_dirs}
+
+
+def _load_test_arrays(wdir: Path, info: dict):
+    """Load test_x and test_ts for a window."""
+    test_x = np.load(wdir / "test.npy")
+    try:
+        test_ts = np.load(wdir / "test_timestamp.npy")
+    except FileNotFoundError:
+        test_ts = np.arange(len(test_x), dtype=np.int64) * info.get("intervals", 60)
+    return test_x, test_ts
+
+
+# ─────────────────────────────────────────────
+# Training pool builders (with pseudo-labels)
+# ─────────────────────────────────────────────
+
+def _build_pool_p1(window_dirs, top_services, target_mt,
+                   pseudo_labels=None, wid_map=None):
+    """P1 pool: full train_x (68 feats) + optional pseudo-labeled test windows."""
+    Xs, ys, sample_ws = [], [], []
+
+    # True labeled training windows
     for wdir in window_dirs:
         info = json.loads((wdir / "info.json").read_text())
         if info.get("metric_type") != target_mt:
@@ -284,18 +301,46 @@ def _build_pool_p1(window_dirs, top_services, target_mt):
         feats = make_features(train_x, train_ts, train_x, info, service, top_services)
         Xs.append(feats)
         ys.append(train_y)
+        sample_ws.append(np.ones(len(train_y), dtype=np.float32))
+
+    # Pseudo-labeled test windows
+    if pseudo_labels and wid_map:
+        for wid, pseudo_y in pseudo_labels.items():
+            if pseudo_y.sum() == 0:
+                continue
+            wdir = wid_map.get(wid)
+            if wdir is None:
+                continue
+            info = json.loads((wdir / "info.json").read_text())
+            if info.get("metric_type") != target_mt:
+                continue
+            train_x = np.load(wdir / "train.npy")
+            test_x, test_ts = _load_test_arrays(wdir, info)
+            if len(test_x) != len(pseudo_y):
+                continue
+            service = parse_service(info.get("case_name", ""))
+            feats = make_features(test_x, test_ts, train_x, info, service, top_services)
+            Xs.append(feats)
+            ys.append(pseudo_y)
+            sample_ws.append(np.full(len(pseudo_y), PSEUDO_WEIGHT, dtype=np.float32))
+
     if not Xs:
-        return np.zeros((0, N_FEATS_P1), np.float32), np.zeros(0, np.int64)
-    return np.vstack(Xs), np.hstack(ys)
+        return (np.zeros((0, N_FEATS_P1), np.float32),
+                np.zeros(0, np.int64), np.zeros(0, np.float32))
+    return np.vstack(Xs), np.hstack(ys), np.hstack(sample_ws)
 
 
-def _build_pool_p2(window_dirs, top_services, target_mt, split_frac=SPLIT_FRAC):
-    """P2 pool: temporal splits, 75 features.
+def _build_pool_p2(window_dirs, top_services, target_mt, split_frac=SPLIT_FRAC,
+                   pseudo_labels=None, wid_map=None):
+    """P2 pool: temporal splits (75 feats) + optional pseudo-labeled test windows.
 
-    For each window: first split_frac = reference, last (1-split_frac) = pseudo-test.
-    Shift features computed relative to the reference portion → non-trivial during training.
+    For pseudo-labeled test windows: ref_x = train_x[:split_frac] (first 70% of
+    training data). This EXACTLY matches the inference distribution of P2, because
+    at inference P2 sees test_x relative to train_x[:split_frac].
     """
-    Xs, ys = [], []
+    Xs, ys, sample_ws = [], [], []
+
+    # True labeled training windows (temporal split)
     for wdir in window_dirs:
         info = json.loads((wdir / "info.json").read_text())
         if info.get("metric_type") != target_mt:
@@ -311,9 +356,9 @@ def _build_pool_p2(window_dirs, top_services, target_mt, split_frac=SPLIT_FRAC):
         cut = max(10, int(n * split_frac))
         if n - cut < 5:
             continue
-        pseudo_y = train_y[cut:]
-        if pseudo_y.sum() == 0:
-            continue  # need positive labels in pseudo-test portion
+        pseudo_y_split = train_y[cut:]
+        if pseudo_y_split.sum() == 0:
+            continue
         ref_x = train_x[:cut]
         pseudo_x = train_x[cut:]
         try:
@@ -324,18 +369,47 @@ def _build_pool_p2(window_dirs, top_services, target_mt, split_frac=SPLIT_FRAC):
         service = parse_service(info.get("case_name", ""))
         feats = make_features_shift(pseudo_x, pseudo_ts, ref_x, info, service, top_services)
         Xs.append(feats)
-        ys.append(pseudo_y)
+        ys.append(pseudo_y_split)
+        sample_ws.append(np.ones(len(pseudo_y_split), dtype=np.float32))
+
+    # Pseudo-labeled test windows: ref_x = train_x[:split_frac]
+    if pseudo_labels and wid_map:
+        for wid, pseudo_y in pseudo_labels.items():
+            if pseudo_y.sum() == 0:
+                continue
+            wdir = wid_map.get(wid)
+            if wdir is None:
+                continue
+            info = json.loads((wdir / "info.json").read_text())
+            if info.get("metric_type") != target_mt:
+                continue
+            train_x = np.load(wdir / "train.npy")
+            cut = max(1, int(len(train_x) * split_frac))
+            ref_x = train_x[:cut]
+            test_x, test_ts = _load_test_arrays(wdir, info)
+            if len(test_x) != len(pseudo_y):
+                continue
+            if len(test_x) < 5:
+                continue
+            service = parse_service(info.get("case_name", ""))
+            feats = make_features_shift(test_x, test_ts, ref_x, info, service, top_services)
+            Xs.append(feats)
+            ys.append(pseudo_y)
+            sample_ws.append(np.full(len(pseudo_y), PSEUDO_WEIGHT, dtype=np.float32))
+
     if not Xs:
-        return np.zeros((0, N_FEATS_P2), np.float32), np.zeros(0, np.int64)
-    return np.vstack(Xs), np.hstack(ys)
+        return (np.zeros((0, N_FEATS_P2), np.float32),
+                np.zeros(0, np.int64), np.zeros(0, np.float32))
+    return np.vstack(Xs), np.hstack(ys), np.hstack(sample_ws)
 
 
 # ─────────────────────────────────────────────
 # Ensemble fitting
 # ─────────────────────────────────────────────
 
-def _fit_models(X: np.ndarray, y: np.ndarray, label: str) -> dict:
-    """Train 3 RF + 5 HGBT + 1 LR on X, y. Returns bundle dict."""
+def _fit_models(X: np.ndarray, y: np.ndarray, label: str,
+                sample_weight: np.ndarray | None = None) -> dict:
+    """Train 3 RF + 5 HGBT + 1 LR. Supports sample_weight for pseudo-labeling."""
     scaler = StandardScaler().fit(X)
     X_scaled = scaler.transform(X)
 
@@ -346,7 +420,7 @@ def _fit_models(X: np.ndarray, y: np.ndarray, label: str) -> dict:
             n_estimators=200, max_depth=15, min_samples_leaf=10,
             class_weight="balanced", random_state=s, n_jobs=4,
         )
-        rf.fit(X, y)
+        rf.fit(X, y, sample_weight=sample_weight)
         rfs.append(rf)
     print(f"    {label} 3-seed RF fit {time.time() - t0:.1f}s")
 
@@ -357,27 +431,34 @@ def _fit_models(X: np.ndarray, y: np.ndarray, label: str) -> dict:
             max_iter=200, max_depth=8, learning_rate=0.05,
             min_samples_leaf=20, random_state=s, class_weight="balanced",
         )
-        hgbt.fit(X, y)
+        hgbt.fit(X, y, sample_weight=sample_weight)
         hgbts.append(hgbt)
     print(f"    {label} 5-seed HGBT fit {time.time() - t0:.1f}s")
 
     t0 = time.time()
     lr = LogisticRegression(C=0.5, max_iter=500, class_weight="balanced", solver="lbfgs")
-    lr.fit(X_scaled, y)
+    lr.fit(X_scaled, y, sample_weight=sample_weight)
     print(f"    {label} 1 LR fit {time.time() - t0:.1f}s")
 
     return {"rfs": rfs, "hgbts": hgbts, "lr": lr, "scaler": scaler}
 
 
-def fit_both_ensembles(window_dirs, top_services) -> Dict[str, dict]:
+def fit_both_ensembles(window_dirs, top_services,
+                       pseudo_labels=None, wid_map=None) -> Dict[str, dict]:
     """For each metric_type: fit P1 (68 feats) and P2 (75 feats) bundles."""
     ensembles: Dict[str, dict] = {}
     for mt in METRIC_TYPES:
         print(f"  [{mt}] building pools…", flush=True)
         t0 = time.time()
-        X1, y1 = _build_pool_p1(window_dirs, top_services, mt)
-        X2, y2 = _build_pool_p2(window_dirs, top_services, mt)
-        print(f"    P1 X={X1.shape} pos={y1.mean():.3f}  "
+        X1, y1, w1 = _build_pool_p1(window_dirs, top_services, mt,
+                                     pseudo_labels, wid_map)
+        X2, y2, w2 = _build_pool_p2(window_dirs, top_services, mt,
+                                     pseudo_labels=pseudo_labels, wid_map=wid_map)
+
+        n_pseudo_p1 = sum(1 for wid, py in (pseudo_labels or {}).items()
+                          if py.sum() > 0 and wid_map and wid_map.get(wid) is not None
+                          and json.loads((wid_map[wid] / "info.json").read_text()).get("metric_type") == mt)
+        print(f"    P1 X={X1.shape} pos={y1.mean():.3f} pseudo_windows≈{n_pseudo_p1}  "
               f"P2 X={X2.shape} pos={y2.mean() if len(y2) else 0:.3f}  "
               f"build={time.time()-t0:.1f}s")
 
@@ -385,11 +466,11 @@ def fit_both_ensembles(window_dirs, top_services) -> Dict[str, dict]:
             print(f"    SKIP P1 — too few samples")
             continue
 
-        bundle_p1 = _fit_models(X1, y1, "P1")
+        bundle_p1 = _fit_models(X1, y1, "P1", sample_weight=w1)
 
         bundle_p2 = None
         if len(X2) >= 50:
-            bundle_p2 = _fit_models(X2, y2, "P2")
+            bundle_p2 = _fit_models(X2, y2, "P2", sample_weight=w2)
         else:
             print(f"    SKIP P2 — too few samples ({len(X2)})")
 
@@ -398,7 +479,7 @@ def fit_both_ensembles(window_dirs, top_services) -> Dict[str, dict]:
 
 
 # ─────────────────────────────────────────────
-# Inference
+# Inference (identical to v43)
 # ─────────────────────────────────────────────
 
 def _score_bundle(bundle: dict, X: np.ndarray) -> np.ndarray:
@@ -469,17 +550,18 @@ def predict_window(test_x, test_ts, train_x_ref, info, service, top_services,
 # Validation + submission
 # ─────────────────────────────────────────────
 
-def run_validation(seed: int = 42):
+def run_validation(pseudo_labels, wid_map, seed: int = 42):
     print("\n>>> Building stratified holdout (10%)…")
     train_pool, holdout = stratified_holdout(all_window_dirs(), frac=0.10, seed=seed)
-    print(f"    train_pool={len(train_pool)}  holdout={len(holdout)}")
+    print(f"    train_pool={len(train_pool)}  holdout={len(holdout)}  "
+          f"pseudo_windows={sum(1 for py in pseudo_labels.values() if py.sum()>0)}")
 
     print(">>> Computing top-30 services from train_pool…")
     top_services = compute_top_services(train_pool, k=TOP_K_SERVICES)
 
-    print(">>> Fitting P1+P2 ensembles on train_pool…")
+    print(">>> Fitting P1+P2 ensembles on train_pool + pseudo-labeled test…")
     t0 = time.time()
-    ensembles = fit_both_ensembles(train_pool, top_services)
+    ensembles = fit_both_ensembles(train_pool, top_services, pseudo_labels, wid_map)
     print(f"    total fit time {time.time() - t0:.1f}s")
 
     def predictor(window):
@@ -493,15 +575,15 @@ def run_validation(seed: int = 42):
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v50 more-minmax (CW-LOO)")
+    print_summary_v2(rep, "v51 pseudo-label (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v50_more_minmax_loo")
+    save_report(rep, "v51_pseudo_label_loo")
     return rep, ensembles, top_services
 
 
 def generate_submission(ensembles, top_services,
-                        output: Path = Path("submission_v43_shift_pipeline.json")) -> Path:
+                        output: Path = Path("submission_v51_pseudo_label.json")) -> Path:
     print(f"\n>>> Generating predictions on all 1000 test windows…")
     preds: Dict[str, list] = {}
     t0 = time.time()
@@ -528,11 +610,19 @@ def generate_submission(ensembles, top_services,
 
 
 if __name__ == "__main__":
-    rep, ensembles, top_services = run_validation()
-    print("\n>>> Re-training on ALL 1000 windows for final submission…")
+    print(f">>> Loading pseudo-labels from {PSEUDO_SOURCE}…")
+    pseudo_labels = load_pseudo_labels(PSEUDO_SOURCE)
+    n_with_anomalies = sum(1 for py in pseudo_labels.values() if py.sum() > 0)
+    print(f"    {len(pseudo_labels)} windows, {n_with_anomalies} with predicted anomalies")
+
+    wid_map = build_wid_map(all_window_dirs())
+
+    rep, ensembles, top_services = run_validation(pseudo_labels, wid_map)
+
+    print("\n>>> Re-training on ALL 1000 windows + pseudo-labels for final submission…")
     t0 = time.time()
     top_services_full = compute_top_services(all_window_dirs(), k=TOP_K_SERVICES)
-    ensembles_full = fit_both_ensembles(all_window_dirs(), top_services_full)
+    ensembles_full = fit_both_ensembles(all_window_dirs(), top_services_full,
+                                        pseudo_labels, wid_map)
     print(f"    full fit {time.time() - t0:.1f}s")
-    generate_submission(ensembles_full, top_services_full,
-                        output=Path("submission_v50_more_minmax.json"))
+    generate_submission(ensembles_full, top_services_full)
