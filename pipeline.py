@@ -1,28 +1,31 @@
 """
-author v19 — 1D convolutional autoencoder reconstruction-error channel (radical).
+author v20 — test-time adaptation via train-mode BatchNorm at inference (radical).
 
-v18's segment-level classifier showed that every existing channel measures
-essentially the same thing: "is this point unusual relative to a reference".
-The feature importances were dominated by CW score statistics. Adding shape
-features did not help because CW already captures shape implicitly.
+After 4 consecutive failures of new channels / model classes, the validation
+ceiling at exactly 0.9639 says: the architecture isn't the bottleneck.
+The remaining gap to the LB is distribution shift between training and test.
 
-A genuinely different signal type is **reconstruction error** under a model
-that learned only the NORMAL distribution. Train an autoencoder on training
-windows (with high weight on normal points, zero/low weight on anomalies);
-at inference, the points the AE cannot reconstruct are anomalous.
+This experiment tests the simplest TTA approach: switch the CNN ensemble's
+BatchNorm layers from eval-mode (training-time running statistics) to
+train-mode (batch statistics computed on the current test window) at
+inference. If the test distribution differs from the training distribution,
+batch stats from the test window will normalize the activations to a more
+useful range, and the rest of the network's weights — which were trained
+to operate on well-normalized activations — will see input closer to their
+training distribution.
 
-Implementation:
-  - 1D conv autoencoder: input is a 32-point z-scored context window.
-    Encoder: Conv(1→32, k=3) → Conv(32→64, k=5, stride=2) → Conv(64→64, k=7).
-    Decoder: mirror. Bottleneck of 16 channels × 16 timesteps.
-  - Trained on training-window contexts where train_y == 0 (normal points
-    only — this is what makes it an "unsupervised normality model").
-  - Anomaly score per point = squared reconstruction error at the centre.
-  - Added to v14's ensemble at a tunable weight (sweep 0.05/0.10/0.15).
+Trade-offs:
+  + Almost free: one boolean flip per BN layer, no retraining, no new params.
+  + Targets distribution shift directly (the suspected bottleneck).
+  − Test batch is ~300 points per window, which may give noisy BN stats.
+  − Could hurt if the training population stats were already well-calibrated.
 
-Stacks on top of v14 (our current 0.6238 LB best).
+Sweep: compare three CNN inference modes
+  A. eval-mode (current baseline, running statistics)
+  B. train-mode BN (batch statistics from the test window)
+  C. blended: 50/50 average of A and B per-point scores
 
-Run:  uv run python v19_autoencoder.py
+Run:  uv run python v20_tta.py
 """
 
 from __future__ import annotations
@@ -31,12 +34,11 @@ import json
 import time
 import warnings
 from pathlib import Path
+from typing import List
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
@@ -52,11 +54,10 @@ from shared_lib import (
     predict_segments,
 )
 from v6_cnn import (
-    BATCH, DEVICE, LR, SEED, SPECIALIZED, SUBSAMPLE_NEG,
-    _zscore_series,
-    build_training_pool as v6_pool,
+    DEVICE, SPECIALIZED, TinyCNN,
+    build_contexts, build_training_pool as v6_pool,
 )
-from v7_cnn_ensemble import CNN_SEEDS, ensemble_cnn_score, fit_cnn_with_seed
+from v7_cnn_ensemble import CNN_SEEDS, fit_cnn_with_seed
 from validation import (
     all_window_dirs,
     evaluate,
@@ -66,173 +67,59 @@ from validation import (
     stratified_holdout,
 )
 
-CONTEXT = 32
-AE_EPOCHS = 6
-AE_LR = 1e-3
 SEG_KWARGS = dict(smooth=3, thr_frac=0.7, small_k_cutoff=4, max_seg=60)
 CNN_WEIGHT = 0.35
 
 
-# ─────────────────────────────────────────────
-# Autoencoder model
-# ─────────────────────────────────────────────
-
-
-class ConvAE(nn.Module):
-    """Small 1D conv autoencoder for 32-pt context. ~30k params."""
-
-    def __init__(self, context: int = CONTEXT):
-        super().__init__()
-        self.context = context
-        # Encoder
-        self.e1 = nn.Conv1d(1, 32, kernel_size=3, padding=1)            # 32, 32
-        self.e2 = nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2)  # 64, 16
-        self.e3 = nn.Conv1d(64, 64, kernel_size=7, padding=3)            # 64, 16
-        self.bn1, self.bn2, self.bn3 = nn.BatchNorm1d(32), nn.BatchNorm1d(64), nn.BatchNorm1d(64)
-        # Decoder
-        self.d1 = nn.Conv1d(64, 64, kernel_size=7, padding=3)
-        self.d2 = nn.ConvTranspose1d(64, 32, kernel_size=5, stride=2, padding=2, output_padding=1)
-        self.d3 = nn.Conv1d(32, 1, kernel_size=3, padding=1)
-        self.bn4, self.bn5 = nn.BatchNorm1d(64), nn.BatchNorm1d(32)
-
-    def forward(self, x):
-        # x: (B, context)
-        x = x.unsqueeze(1)  # (B, 1, context)
-        h = F.relu(self.bn1(self.e1(x)))
-        h = F.relu(self.bn2(self.e2(h)))
-        h = F.relu(self.bn3(self.e3(h)))
-        h = F.relu(self.bn4(self.d1(h)))
-        h = F.relu(self.bn5(self.d2(h)))
-        out = self.d3(h)
-        return out.squeeze(1)  # (B, context)
-
-
-# ─────────────────────────────────────────────
-# Data: build NORMAL-only contexts pool
-# ─────────────────────────────────────────────
-
-
-def build_contexts(series: np.ndarray, context: int = CONTEXT) -> np.ndarray:
-    s = _zscore_series(series)
-    half = context // 2
-    padded = np.pad(s, (half, half), mode="constant", constant_values=0.0)
-    n = len(s)
-    out = np.empty((n, context), dtype=np.float32)
-    for i in range(n):
-        out[i] = padded[i : i + context]
-    return out
-
-
-def build_normal_pool(window_dirs) -> np.ndarray:
-    """Per-point contexts where train_label == 0 only. AE learns to reconstruct normal points."""
-    Xs = []
-    for wdir in window_dirs:
-        train_y = np.load(wdir / "train_label.npy")
-        train_x = np.load(wdir / "train.npy")
-        if len(train_x) < CONTEXT // 2 + 4:
-            continue
-        ctxs = build_contexts(train_x)
-        mask = train_y == 0
-        Xs.append(ctxs[mask])
-    X = np.vstack(Xs)
-    # Subsample to keep training quick (~80k samples)
-    if len(X) > 80000:
-        rng = np.random.default_rng(SEED)
-        idx = rng.choice(len(X), 80000, replace=False)
-        X = X[idx]
-    return X
-
-
-def fit_autoencoder(X: np.ndarray, seed: int = 42) -> ConvAE:
-    import sys
-    torch.manual_seed(seed); np.random.seed(seed)
-    model = ConvAE().to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=AE_LR)
-    loss_fn = nn.MSELoss()
-
-    ds = TensorDataset(torch.from_numpy(X))
-    dl = DataLoader(ds, batch_size=BATCH, shuffle=True, num_workers=0)
-
-    for epoch in range(AE_EPOCHS):
-        model.train()
-        running, n_batches = 0.0, 0
-        t0 = time.time()
-        for (xb,) in dl:
-            xb = xb.to(DEVICE)
-            opt.zero_grad()
-            recon = model(xb)
-            loss = loss_fn(recon, xb)
-            loss.backward(); opt.step()
-            running += loss.item(); n_batches += 1
-        print(f"      AE epoch {epoch + 1}/{AE_EPOCHS}  loss={running / n_batches:.4f}  "
-              f"({time.time() - t0:.1f}s)", flush=True)
-        sys.stdout.flush()
-    return model
-
-
-# ─────────────────────────────────────────────
-# Reconstruction-error scoring
-# ─────────────────────────────────────────────
-
-
-def ae_score(model: ConvAE, test_x: np.ndarray) -> np.ndarray:
-    """Per-point reconstruction error at the centre of each context window."""
-    model.eval()
+def cnn_score_with_bn_mode(model: TinyCNN, test_x: np.ndarray, *,
+                           use_batch_stats: bool) -> np.ndarray:
+    """Score with the model. If use_batch_stats=True, BN uses the test
+    batch's statistics (train mode for BN only)."""
+    # We always want gradients off
+    model.eval()  # default: gradients off, dropout off, BN uses running stats
+    if use_batch_stats:
+        # Flip only BN layers into train mode so they compute batch stats.
+        # We do NOT call backward, so running_mean/running_var won't be updated
+        # in a way that contaminates other windows — but to be safe, after
+        # this call we set them back to eval.
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.train()
     X = build_contexts(test_x)
     with torch.no_grad():
         xb = torch.from_numpy(X).to(DEVICE)
-        recon = model(xb).cpu().numpy()
-    # Squared error at centre position
-    centre = CONTEXT // 2
-    return (recon[:, centre] - X[:, centre]) ** 2
+        logits = model(xb)
+        proba = torch.sigmoid(logits).cpu().numpy()
+    # Always restore eval mode at the end
+    model.eval()
+    return proba
 
 
-# ─────────────────────────────────────────────
-# Ensemble integration
-# ─────────────────────────────────────────────
+def ensemble_score_with_bn(models: List, test_x: np.ndarray, *,
+                           mode: str) -> np.ndarray:
+    """mode ∈ {'eval', 'batch', 'blend'}"""
+    if mode == "eval":
+        eval_scores = np.stack([cnn_score_with_bn_mode(m, test_x, use_batch_stats=False)
+                                for m in models])
+        return eval_scores.mean(axis=0)
+    if mode == "batch":
+        batch_scores = np.stack([cnn_score_with_bn_mode(m, test_x, use_batch_stats=True)
+                                 for m in models])
+        return batch_scores.mean(axis=0)
+    # blend
+    e = np.stack([cnn_score_with_bn_mode(m, test_x, use_batch_stats=False)
+                  for m in models]).mean(axis=0)
+    b = np.stack([cnn_score_with_bn_mode(m, test_x, use_batch_stats=True)
+                  for m in models]).mean(axis=0)
+    return 0.5 * e + 0.5 * b
 
 
-def scores_with_ae(train_x, train_y, test_x, cw, cnn_models, ae_model,
-                   metric_type, ae_weight: float = 0.10) -> np.ndarray:
-    """v14 ensemble + autoencoder channel at low weight, trimming CW share."""
+def scores_v14_with_cnn(train_x, train_y, test_x, cw, cnn_models, metric_type,
+                        cnn_mode: str) -> np.ndarray:
     category = categorize_window(train_x, test_x)
-    cw_s   = normalize_scores(cw.predict_proba(test_x, metric_type=metric_type))
-    cnn_s  = normalize_scores(ensemble_cnn_score(cnn_models, test_x))
-    ae_s   = normalize_scores(ae_score(ae_model, test_x))
+    cw_s = normalize_scores(cw.predict_proba(test_x, metric_type=metric_type))
+    cnn_s = normalize_scores(ensemble_score_with_bn(cnn_models, test_x, mode=cnn_mode))
 
-    if category == "constant_train":
-        if_s = normalize_scores(isolation_forest_test(test_x, train_y))
-        return ((0.50 - ae_weight) * cw_s + 0.50 * if_s
-                + CNN_WEIGHT * cnn_s + ae_weight * ae_s
-                - CNN_WEIGHT * cw_s)  # cancel CNN's slice off cw, keep formula consistent
-    if category == "disjoint":
-        g_s = normalize_scores(global_distance_score(train_x, test_x))
-        if_s = normalize_scores(isolation_forest_test(test_x, train_y))
-        return (0.35 * cw_s + 0.30 * g_s + (0.35 - CNN_WEIGHT - ae_weight) * if_s
-                + CNN_WEIGHT * cnn_s + ae_weight * ae_s)
-    if category == "partial_overlap":
-        pw    = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
-        local = normalize_scores(online_ensemble(test_x, window=15))
-        return (0.35 * cw_s + 0.35 * pw + (0.30 - CNN_WEIGHT - ae_weight) * local
-                + CNN_WEIGHT * cnn_s + ae_weight * ae_s)
-    if category == "test_within_train":
-        pw = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
-        return ((0.50 - CNN_WEIGHT - ae_weight) * cw_s + 0.50 * pw
-                + CNN_WEIGHT * cnn_s + ae_weight * ae_s)
-    return np.zeros(len(test_x))
-
-
-def scores_v14(train_x, train_y, test_x, cw, cnn_models, metric_type) -> np.ndarray:
-    """Baseline v14 with no AE channel."""
-    return scores_with_ae(train_x, train_y, test_x, cw, cnn_models,
-                          ae_model=None, metric_type=metric_type, ae_weight=0.0) \
-        if False else _scores_v14_noae(train_x, train_y, test_x, cw, cnn_models, metric_type)
-
-
-def _scores_v14_noae(train_x, train_y, test_x, cw, cnn_models, metric_type) -> np.ndarray:
-    category = categorize_window(train_x, test_x)
-    cw_s   = normalize_scores(cw.predict_proba(test_x, metric_type=metric_type))
-    cnn_s  = normalize_scores(ensemble_cnn_score(cnn_models, test_x))
     if category == "constant_train":
         if_s = normalize_scores(isolation_forest_test(test_x, train_y))
         return (0.50 - CNN_WEIGHT) * cw_s + 0.50 * if_s + CNN_WEIGHT * cnn_s
@@ -241,7 +128,7 @@ def _scores_v14_noae(train_x, train_y, test_x, cw, cnn_models, metric_type) -> n
         if_s = normalize_scores(isolation_forest_test(test_x, train_y))
         return 0.35 * cw_s + 0.30 * g_s + (0.35 - CNN_WEIGHT) * if_s + CNN_WEIGHT * cnn_s
     if category == "partial_overlap":
-        pw    = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
+        pw = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
         local = normalize_scores(online_ensemble(test_x, window=15))
         return 0.35 * cw_s + 0.35 * pw + (0.30 - CNN_WEIGHT) * local + CNN_WEIGHT * cnn_s
     if category == "test_within_train":
@@ -277,59 +164,45 @@ def run_validation(seed: int = 42) -> dict:
         cnn_models.append(fit_cnn_with_seed(Xc, yc, s))
         print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
 
-    print(">>> Building NORMAL-only pool for AE…")
-    Xae = build_normal_pool(train_pool)
-    print(f"    AE pool X={Xae.shape}")
-    print(">>> Training autoencoder…")
-    t0 = time.time()
-    ae_model = fit_autoencoder(Xae, seed=42)
-    print(f"    fit {time.time() - t0:.1f}s")
-
-    def predictor_factory(ae_w):
+    def predictor(cnn_mode: str):
         def pred(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
-            if ae_w == 0:
-                scores = _scores_v14_noae(sub_tr_x, sub_tr_y, sub_te_x, cw, cnn_models,
-                                          info.get("metric_type", "ALL"))
-            else:
-                scores = scores_with_ae(sub_tr_x, sub_tr_y, sub_te_x, cw, cnn_models,
-                                        ae_model, info.get("metric_type", "ALL"),
-                                        ae_weight=ae_w)
+            scores = scores_v14_with_cnn(sub_tr_x, sub_tr_y, sub_te_x, cw, cnn_models,
+                                         info.get("metric_type", "ALL"), cnn_mode)
             return predict_segments(scores, int(round(len(sub_te_x) * ratio)), **SEG_KWARGS)
         return pred
 
-    print("\n>>> Eval: v14 baseline (no AE)…")
-    rep_base = evaluate(predictor_factory(0.0), holdout)
-    print_summary(rep_base, name="v14 baseline")
-
-    results = {"baseline": rep_base["overall_f1"]}
-    for w in (0.05, 0.10, 0.15, 0.20):
-        print(f"\n>>> Eval: v19 with AE_WEIGHT={w:.2f}…")
-        rep = evaluate(predictor_factory(w), holdout)
-        print_summary(rep, name=f"v19 ae_w={w:.2f}")
-        results[f"ae_w_{w:.2f}"] = rep["overall_f1"]
+    results = {}
+    for mode in ("eval", "batch", "blend"):
+        print(f"\n>>> Eval: CNN inference mode = {mode}…")
+        rep = evaluate(predictor(mode), holdout)
+        print_summary(rep, name=f"CNN-{mode}")
+        results[mode] = rep
 
     print("\n──────  summary ──────")
-    base = results["baseline"]
-    rows = sorted([(k, v) for k, v in results.items() if k != "baseline"], key=lambda kv: -kv[1])
-    print(f"  baseline   F1={base:.4f}")
-    for name, f1 in rows:
-        print(f"  {name}  F1={f1:.4f}  Δ_vs_baseline={f1 - base:+.4f}")
+    base = results["eval"]["overall_f1"]
+    for mode, rep in results.items():
+        print(f"  cnn_mode={mode:<6}  F1={rep['overall_f1']:.4f}  Δ_vs_eval={rep['overall_f1'] - base:+.4f}")
 
-    winner_name, winner_f1 = rows[0]
+    # Pick winner
+    winner_mode = max(results, key=lambda m: results[m]["overall_f1"])
+    winner_f1 = results[winner_mode]["overall_f1"]
+    print(f"\n  Winner: cnn_mode={winner_mode}  F1={winner_f1:.4f}")
+
     report = {
-        "results": results,
-        "winner": winner_name,
-        "delta_vs_baseline": winner_f1 - base,
+        "by_mode": {m: r["overall_f1"] for m, r in results.items()},
+        "winner_mode": winner_mode,
+        "delta_winner_vs_eval": winner_f1 - base,
+        "per_metric_by_mode": {m: r["by_metric_type"] for m, r in results.items()},
         "seed": seed,
         "n_holdout": len(holdout),
     }
-    save_report(report, "v19_autoencoder")
-    return report, cw, cnn_models, ae_model
+    save_report(report, "v20_tta")
+    return report, cw, cnn_models
 
 
-def generate_submission(ae_weight: float, cw, cnn_models, ae_model,
-                        output: Path = Path("submission_autoencoder.json")) -> Path:
-    print(f"\n>>> Re-training all models on ALL 1000 windows (ae_weight={ae_weight:.2f})…")
+def generate_submission(cnn_mode: str, cw, cnn_models,
+                        output: Path = Path("submission_tta.json")) -> Path:
+    print(f"\n>>> Re-training all models on ALL 1000 windows (cnn_mode={cnn_mode})…")
     t0 = time.time()
     cw_full = build_rf_hybrid(all_window_dirs())
     print(f"    rf fit {time.time() - t0:.1f}s")
@@ -341,20 +214,14 @@ def generate_submission(ae_weight: float, cw, cnn_models, ae_model,
         cnn_full.append(fit_cnn_with_seed(Xc, yc, s))
         print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
 
-    Xae = build_normal_pool(all_window_dirs())
-    print(f"    AE pool X={Xae.shape}")
-    t0 = time.time()
-    ae_full = fit_autoencoder(Xae, seed=42)
-    print(f"    ae fit {time.time() - t0:.1f}s")
-
     print(">>> Generating predictions…")
     preds: dict[str, list[int]] = {}
     t0 = time.time()
     for i, wdir in enumerate(all_window_dirs(), 1):
         w = load_window(wdir)
         ratio = float(w.info.get("test set anomaly ratio", 0.0))
-        scores = scores_with_ae(w.train_x, w.train_y, w.test_x, cw_full, cnn_full,
-                                ae_full, w.metric_type, ae_weight=ae_weight)
+        scores = scores_v14_with_cnn(w.train_x, w.train_y, w.test_x, cw_full, cnn_full,
+                                     w.metric_type, cnn_mode)
         k = int(round(len(w.test_x) * ratio))
         preds[w.wid] = predict_segments(scores, k, **SEG_KWARGS).astype(int).tolist()
         if i % 100 == 0:
@@ -370,12 +237,11 @@ def generate_submission(ae_weight: float, cw, cnn_models, ae_model,
 
 
 if __name__ == "__main__":
-    rep, cw, cnn_models, ae_model = run_validation()
-    if rep["delta_vs_baseline"] > 0.003:
-        ae_w = float(rep["winner"].replace("ae_w_", ""))
-        print(f"\nAE channel at weight {ae_w} beats baseline by {rep['delta_vs_baseline']:+.4f}; "
+    rep, cw, cnn_models = run_validation()
+    if rep["winner_mode"] != "eval" and rep["delta_winner_vs_eval"] > 0.002:
+        print(f"\nCNN mode {rep['winner_mode']} beats eval by {rep['delta_winner_vs_eval']:+.4f}; "
               "generating submission.")
-        generate_submission(ae_w, cw, cnn_models, ae_model)
+        generate_submission(rep["winner_mode"], cw, cnn_models)
     else:
-        print(f"\nAE channel did not meaningfully help "
-              f"(best Δ = {rep['delta_vs_baseline']:+.4f}); submission NOT generated.")
+        print(f"\nTTA did not meaningfully help "
+              f"(best Δ = {rep['delta_winner_vs_eval']:+.4f}); submission NOT generated.")
