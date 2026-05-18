@@ -104,3 +104,31 @@ STL captures this.
 - Each service appears EXACTLY ONCE — no cross-metric features possible
 - For intervals ≥ 864s (421 windows): 3+ daily cycles in training → STL feasible
 - For 3600s (127 windows): 24 pts/day, ~13 days training → excellent STL candidate
+
+---
+
+## ⚠️ CRITICAL: GitHub Tracking Requirement (2026-05-18)
+
+**All changes, new submissions, and experiment results MUST be tracked on GitHub.**
+- Commit every new script, submission JSON, and result file to the repo.
+- Push after every agent completes a run.
+- Tag submissions with version numbers for traceability.
+- Remote: `https://github.com/JoseManuelDavilaMancilla/time-series-anomaly-detection.git`
+
+---
+
+## Agent Swarm Deployed (2026-05-18)
+
+Target: **0.73 LB** (gap = 0.0395 from current best 0.6905).
+Swarm strategy: parallel exploration of high-EV paths.
+See `AGENTS.md` for full role definitions.
+
+| Agent | Task | ETA | Expected Gain |
+|---|---|---|---|
+| **Agent 1 (Runner)** | Run v71 baseline → generate `submission_v71_catch22.json`; if LOO ≥ 0.315, submit. | ~30-60 min | Unknown (first run) |
+| **Agent 2 (Segmenter)** | Port contiguous segment selection (smooth=3, thr_frac=0.7) from old pipeline to v71's `predict_window()`. | ~20 min | +0.010–0.015 |
+| **Agent 3 (DL-Builder)** | Build 1D CNN ensemble (3-seed, 32-pt context) as add-on model in v71 ensemble. | ~40 min | +0.005–0.011 |
+| **Agent 4 (Radical)** | Research & prototype: confidence-weighted pseudo-labels, TTA, per-window RF hybrid. | ~45 min | +0.005–0.020 |
+
+**Combination hypothesis**: If 2+ agents win independently, stack them. Segment selection + CNN + v71 base could plausibly reach 0.705–0.715.
+
