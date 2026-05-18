@@ -1,31 +1,41 @@
 """
-author v60 — FFT reconstruction error features.
+author v61 — Persistent homology (TDA) features.
 
-Classical approach: fit the dominant periodic components of the signal,
-then use the reconstruction error (actual - periodic_fit) as anomaly features.
-Anomalies are points that deviate from the expected periodic pattern.
+Approach: Takens delay embedding (dim=2, lag=1) converts each 1D time series
+into a 2D point cloud, then ripser computes H0 and H1 persistence diagrams.
 
-New features added (5 per point, +5 total):
-  - test_fft_residual      : test_x - FFT reconstruction (top-K components)
-  - test_fft_residual_z    : robust z-score of the above (within test_x)
-  - test_res_vs_train      : residual normalised by train's residual std
-                             (measures how unusual test deviations are vs train)
-  - periodicity_strength   : fraction of train_x variance captured by top-K
-                             components (broadcast scalar — how periodic is
-                             this window type)
-  - train_fft_res_std_log  : log(std of train reconstruction residuals)
-                             (broadcast scalar — scale of "normal" deviations)
+10 new window-level features (broadcast to all points):
+  H0 (connected components / gaps):
+    test_h0_max        — largest gap in the test point cloud (outlier signal)
+    test_h0_sum        — total H0 persistence (overall spread)
+    test_h0_entropy    — persistence entropy (how concentrated the gaps are)
+  H1 (loops / cycles):
+    test_h1_max        — most persistent cycle (periodicity signal)
+    test_h1_sum        — total loop structure
+    test_h1_n_sig      — number of significant cycles (> max/4)
+  Train reference (context):
+    train_h0_max       — train's gap structure (scale reference)
+    train_h1_max       — train's periodicity (context)
+  Topological shift (train→test):
+    h0_bottleneck_dist — bottleneck distance between train and test H0 diagrams
+    h1_bottleneck_dist — same for H1 (topological distribution shift)
 
-K = min(10, n_test // 4) — adaptive to series length.
+Why this matters:
+  - H1 max captures periodicity destruction: a normal QPS window has strong
+    cycles; an anomalous window that breaks the pattern has weaker H1.
+  - H0 max captures large outliers: a spike creates an isolated point far
+    from the main cluster → large H0 lifetime.
+  - Bottleneck distance is a direct "topological shift" signal that no
+    rolling or FFT feature can represent.
 
-N_FEATS_P1: 77 → 82
-N_FEATS_P2: 84 → 89
+Stacked on v60 (FFT features):
+  N_FEATS_P1: 82 → 92   (+10 TDA)
+  N_FEATS_P2: 89 → 99   (+10 TDA)
 
-Base: v58 (HGBT, not LightGBM) to isolate FFT effect.
-Pseudo-labels: submission_v59_lgbm_multirounds.json (run after v59 finishes).
-If v59 not yet available, falls back to submission_v58_global_ctx.json.
+Pseudo-labels from submission_v60_fft_features.json (LB 0.6859, current best).
+PSEUDO_WEIGHT = 0.50 (unchanged).
 
-Run:  uv run python v60_fft_features.py
+Run:  uv run python v61_tda.py
 """
 
 from __future__ import annotations
@@ -39,6 +49,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
+from ripser import ripser
+from persim import bottleneck as persim_bottleneck
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
@@ -58,28 +70,114 @@ SMOOTH_W       = 5
 SMOOTH_ALPHA   = 0.8
 W_SHIFT        = 0.30
 SPLIT_FRAC     = 0.70
+N_TDA_FEATS    = 10
 N_FFT_FEATS    = 5
-N_FEATS_P1     = 77 + N_FFT_FEATS   # 82
-N_FEATS_P2     = 84 + N_FFT_FEATS   # 89
+N_FEATS_P1     = 77 + N_FFT_FEATS + N_TDA_FEATS   # 92
+N_FEATS_P2     = 84 + N_FFT_FEATS + N_TDA_FEATS   # 99
 PSEUDO_WEIGHT  = 0.50
-
-# v59 (LightGBM) scored 0.6834 < v58 (HGBT) 0.6847 — use v58 as pseudo-label source
-PSEUDO_SOURCE  = Path("submission_v58_global_ctx.json")
+PSEUDO_SOURCE  = Path("submission_v60_fft_features.json")   # LB 0.6859
+TDA_MAX_PTS    = 300    # subsample point cloud for speed
+TDA_DIM        = 2      # Takens embedding dimension
+TDA_LAG        = 1      # Takens lag
 
 
 # ─────────────────────────────────────────────
-# FFT reconstruction helpers
+# TDA helpers
+# ─────────────────────────────────────────────
+
+def _takens_embed(x: np.ndarray, dim: int = TDA_DIM, lag: int = TDA_LAG) -> np.ndarray:
+    n = len(x) - (dim - 1) * lag
+    return np.stack([x[i * lag: n + i * lag] for i in range(dim)], axis=1)
+
+
+def _persistence_entropy(lifetimes: np.ndarray) -> float:
+    total = lifetimes.sum()
+    if total < 1e-10:
+        return 0.0
+    p = lifetimes / total
+    return float(-np.sum(p * np.log(p + 1e-9)))
+
+
+def _prepare_cloud(x: np.ndarray) -> np.ndarray:
+    """Subsample, embed, and normalise to unit std."""
+    if len(x) > TDA_MAX_PTS:
+        idx = np.linspace(0, len(x) - 1, TDA_MAX_PTS, dtype=int)
+        x = x[idx]
+    cloud = _takens_embed(x.astype(np.float64))
+    cloud -= cloud.mean(axis=0)
+    scale = cloud.std() + 1e-9
+    return cloud / scale
+
+
+def _extract_diagram_features(dgm: np.ndarray, hdim: int) -> Tuple[float, float, float, int]:
+    """max_lifetime, sum_lifetimes, entropy, n_significant."""
+    if hdim == 0:
+        dgm = dgm[dgm[:, 1] < np.inf]   # remove the one infinite H0 bar
+    if len(dgm) == 0:
+        return 0.0, 0.0, 0.0, 0
+    lifetimes = dgm[:, 1] - dgm[:, 0]
+    max_l = float(lifetimes.max())
+    return (max_l,
+            float(lifetimes.sum()),
+            _persistence_entropy(lifetimes),
+            int((lifetimes > max_l / 4 + 1e-10).sum()))
+
+
+def _safe_bottleneck(dgm_a: np.ndarray, dgm_b: np.ndarray, hdim: int) -> float:
+    """Bottleneck distance between two persistence diagrams; 0 on failure."""
+    if hdim == 0:
+        dgm_a = dgm_a[dgm_a[:, 1] < np.inf]
+        dgm_b = dgm_b[dgm_b[:, 1] < np.inf]
+    if len(dgm_a) == 0 and len(dgm_b) == 0:
+        return 0.0
+    # persim.bottleneck requires at least one non-empty diagram
+    if len(dgm_a) == 0:
+        dgm_a = np.zeros((1, 2))
+    if len(dgm_b) == 0:
+        dgm_b = np.zeros((1, 2))
+    try:
+        return float(persim_bottleneck(dgm_a, dgm_b))
+    except Exception:
+        return 0.0
+
+
+def tda_window_features(test_x: np.ndarray, train_x: np.ndarray) -> np.ndarray:
+    """
+    Compute 10 TDA features for a window and return shape-(10,) float32 array.
+    All features are window-level scalars (broadcast to every point).
+    """
+    test_cloud  = _prepare_cloud(test_x)
+    train_cloud = _prepare_cloud(train_x)
+
+    test_dgms  = ripser(test_cloud,  maxdim=1)["dgms"]
+    train_dgms = ripser(train_cloud, maxdim=1)["dgms"]
+
+    t_h0_max, t_h0_sum, t_h0_ent, _      = _extract_diagram_features(test_dgms[0],  0)
+    t_h1_max, t_h1_sum, _,        t_h1_n = _extract_diagram_features(test_dgms[1],  1)
+    r_h0_max, *_                          = _extract_diagram_features(train_dgms[0], 0)
+    r_h1_max, *_                          = _extract_diagram_features(train_dgms[1], 1)
+
+    h0_bn = _safe_bottleneck(test_dgms[0], train_dgms[0], 0)
+    h1_bn = _safe_bottleneck(test_dgms[1], train_dgms[1], 1)
+
+    return np.array([
+        t_h0_max, t_h0_sum, t_h0_ent,
+        t_h1_max, t_h1_sum, float(t_h1_n),
+        r_h0_max, r_h1_max,
+        h0_bn,    h1_bn,
+    ], dtype=np.float32)
+
+
+# ─────────────────────────────────────────────
+# FFT helpers (identical to v60)
 # ─────────────────────────────────────────────
 
 def _fft_reconstruct(x: np.ndarray, n_keep: int) -> np.ndarray:
-    """Reconstruct x keeping only the top n_keep non-DC frequency components."""
     n = len(x)
     if n < 8:
         return np.full(n, np.mean(x))
     X = np.fft.rfft(x)
-    mags = np.abs(X)
-    # Always keep DC; select top n_keep by magnitude among the rest
-    top = np.argsort(mags[1:])[::-1][:n_keep] + 1  # shift back past DC
+    top = np.argsort(np.abs(X)[1:])[::-1][:n_keep] + 1
     mask = np.zeros(len(X), dtype=bool)
     mask[0] = True
     mask[top] = True
@@ -87,39 +185,25 @@ def _fft_reconstruct(x: np.ndarray, n_keep: int) -> np.ndarray:
 
 
 def _fft_anomaly_features(test_x: np.ndarray, train_x: np.ndarray) -> np.ndarray:
-    """
-    5 per-point FFT features comparing test_x against its own periodic
-    reconstruction and against train_x's residual distribution.
-    """
     n = len(test_x)
     n_keep = max(1, min(10, n // 4))
-
-    # ── test self-reconstruction residual ──
-    test_recon   = _fft_reconstruct(test_x.astype(np.float64), n_keep)
-    test_res     = test_x.astype(np.float64) - test_recon
-
+    test_recon = _fft_reconstruct(test_x.astype(np.float64), n_keep)
+    test_res   = test_x.astype(np.float64) - test_recon
     res_med  = float(np.median(test_res))
     res_mad  = float(np.median(np.abs(test_res - res_med))) + 1e-9
     test_res_z = np.clip((test_res - res_med) / (1.4826 * res_mad), -10, 10)
 
-    # ── train reconstruction residual stats (window-level scalars) ──
-    n_keep_tr    = max(1, min(10, len(train_x) // 4))
-    train_recon  = _fft_reconstruct(train_x.astype(np.float64), n_keep_tr)
-    train_res    = train_x.astype(np.float64) - train_recon
+    n_keep_tr   = max(1, min(10, len(train_x) // 4))
+    train_recon = _fft_reconstruct(train_x.astype(np.float64), n_keep_tr)
+    train_res   = train_x.astype(np.float64) - train_recon
     train_res_std = float(np.std(train_res)) + 1e-9
+    train_var  = float(np.var(train_x)) + 1e-9
+    recon_var  = float(np.var(train_recon))
+    periodicity_strength = float(np.clip(recon_var / train_var, 0., 1.))
 
-    # periodicity strength: fraction of train variance explained by top-K
-    train_var = float(np.var(train_x)) + 1e-9
-    recon_var = float(np.var(train_recon))
-    periodicity_strength = float(np.clip(recon_var / train_var, 0.0, 1.0))
-
-    # test residual normalised by train residual scale
     test_res_vs_train = np.clip(test_res / train_res_std, -10, 10)
-
     return np.column_stack([
-        test_res,
-        test_res_z,
-        test_res_vs_train,
+        test_res, test_res_z, test_res_vs_train,
         np.full(n, periodicity_strength),
         np.full(n, np.log1p(train_res_std)),
     ]).astype(np.float32)
@@ -153,7 +237,7 @@ def compute_window_global_stats(window_dirs, data_file="train.npy"):
 
         def _z(arr):
             mu, sigma = arr.mean(), arr.std()
-            return np.clip((arr - mu) / (sigma + 1e-9), -5.0, 5.0)
+            return np.clip((arr - mu) / (sigma + 1e-9), -5., 5.)
 
         for i, wdir in enumerate(wdirs):
             result[wdir] = (float(_z(means)[i]), float(_z(stds)[i]), float(_z(maxs)[i]))
@@ -161,14 +245,14 @@ def compute_window_global_stats(window_dirs, data_file="train.npy"):
 
 
 # ─────────────────────────────────────────────
-# Rolling helpers (identical to v58)
+# Rolling helpers (identical to v58/v60)
 # ─────────────────────────────────────────────
 
 def _rolling_mean_std(x, w):
     import pandas as pd
     s = pd.Series(x.astype(np.float64))
     r = s.rolling(w, center=True, min_periods=1)
-    return r.mean().to_numpy(), r.std(ddof=0).fillna(0.0).to_numpy()
+    return r.mean().to_numpy(), r.std(ddof=0).fillna(0.).to_numpy()
 
 def _rolling_minmax(x, w):
     import pandas as pd
@@ -200,7 +284,7 @@ def _time_features(timestamps):
     for i, t in enumerate(timestamps):
         d = datetime.fromtimestamp(int(t), tz=timezone.utc)
         tod[i] = (d.hour + d.minute/60 + d.second/3600) / 24
-        dow[i] = d.weekday() / 7.0
+        dow[i] = d.weekday() / 7.
     return tod, dow
 
 def parse_service(case_name):
@@ -210,11 +294,10 @@ def parse_service(case_name):
 
 
 # ─────────────────────────────────────────────
-# Feature builders (+5 FFT features appended)
+# Feature builders (77 base + 5 FFT + 10 TDA)
 # ─────────────────────────────────────────────
 
 def _base77(x, timestamps, train_x_ref, info, service, top_services, win_global):
-    """77 features identical to v58."""
     n = len(x); feats = []
     median = float(np.median(train_x_ref))
     mad    = float(np.median(np.abs(train_x_ref - median))) + 1e-9
@@ -257,35 +340,36 @@ def _base77(x, timestamps, train_x_ref, info, service, top_services, win_global)
     static = []
     mt = info.get("metric_type", "Unknown")
     for m in METRIC_TYPES:
-        static.append(1.0 if mt == m else 0.0)
+        static.append(1. if mt == m else 0.)
     for ts in top_services:
-        static.append(1.0 if service == ts else 0.0)
-    static += [0.0] * (TOP_K_SERVICES - len(top_services))
-    static += [float(info.get("intervals", 0)) / 3600.0,
-               float(info.get("training set anomaly ratio", 0.0)),
-               float(info.get("test set anomaly ratio", 0.0))]
+        static.append(1. if service == ts else 0.)
+    static += [0.] * (TOP_K_SERVICES - len(top_services))
+    static += [float(info.get("intervals", 0)) / 3600.,
+               float(info.get("training set anomaly ratio", 0.)),
+               float(info.get("test set anomaly ratio", 0.))]
 
-    point_feats   = np.column_stack(feats)
-    feats_static  = np.tile(np.array(static, dtype=np.float64), (n, 1))
+    point_feats  = np.column_stack(feats)
+    feats_static = np.tile(np.array(static, dtype=np.float64), (n, 1))
     return np.hstack([point_feats, feats_static]).astype(np.float32)
 
 
 def make_features(x, timestamps, train_x_ref, info, service, top_services,
                   win_global=(0., 0., 0.)):
-    """82-feature P1 matrix = 77 base + 5 FFT."""
+    """92-feature P1 = 77 base + 5 FFT + 10 TDA."""
     base = _base77(x, timestamps, train_x_ref, info, service, top_services, win_global)
     fft  = _fft_anomaly_features(x, train_x_ref)
-    return np.hstack([base, fft])
+    tda  = tda_window_features(x, train_x_ref)
+    n    = len(x)
+    return np.hstack([base, fft, np.tile(tda, (n, 1))])
 
 
 def make_features_shift(x, timestamps, ref_x, info, service, top_services,
                         win_global=(0., 0., 0.)):
-    """89-feature P2 matrix = 82 + 7 shift."""
+    """99-feature P2 = 92 + 7 shift."""
     base = make_features(x, timestamps, ref_x, info, service, top_services, win_global)
     n = len(x)
     x_med = float(np.median(x)); x_mad = float(np.median(np.abs(x - x_med))) + 1e-9
     ref_std = float(np.std(ref_x)) + 1e-9
-
     shift = np.column_stack([
         _percentile_rank_vs(x, x),
         (x - x_med) / (1.4826 * x_mad),
@@ -299,7 +383,7 @@ def make_features_shift(x, timestamps, ref_x, info, service, top_services,
 
 
 # ─────────────────────────────────────────────
-# Top services
+# Top services / pseudo-label helpers
 # ─────────────────────────────────────────────
 
 def compute_top_services(window_dirs, k=TOP_K_SERVICES):
@@ -308,11 +392,6 @@ def compute_top_services(window_dirs, k=TOP_K_SERVICES):
         info = json.loads((wdir / "info.json").read_text())
         counts[parse_service(info.get("case_name", ""))] += 1
     return [s for s, _ in counts.most_common(k)]
-
-
-# ─────────────────────────────────────────────
-# Pseudo-label helpers
-# ─────────────────────────────────────────────
 
 def load_pseudo_labels(path):
     data = json.loads(path.read_text())
@@ -426,20 +505,17 @@ def _build_pool_p2(window_dirs, top_services, target_mt,
 
 
 # ─────────────────────────────────────────────
-# Ensemble (identical HGBT+RF+LR blend as v58)
+# Ensemble (HGBT + RF + LR, same as v58/v60)
 # ─────────────────────────────────────────────
 
 def _fit_models(X, y, label, sample_weight=None):
-    scaler = StandardScaler().fit(X)
-    X_sc = scaler.transform(X)
-
+    scaler = StandardScaler().fit(X); X_sc = scaler.transform(X)
     t0 = time.time()
     rfs = [RandomForestClassifier(n_estimators=200, max_depth=15, min_samples_leaf=10,
                                    class_weight="balanced", random_state=s, n_jobs=4).fit(
                                        X, y, sample_weight=sample_weight)
            for s in (0, 1, 2)]
     print(f"    {label} 3-seed RF  {time.time()-t0:.1f}s")
-
     t0 = time.time()
     hgbts = [HistGradientBoostingClassifier(max_iter=200, max_depth=8, learning_rate=0.05,
                                              min_samples_leaf=20, random_state=s,
@@ -447,7 +523,6 @@ def _fit_models(X, y, label, sample_weight=None):
                                                  X, y, sample_weight=sample_weight)
              for s in range(5)]
     print(f"    {label} 5-seed HGBT {time.time()-t0:.1f}s")
-
     t0 = time.time()
     lr = LogisticRegression(C=0.5, max_iter=500, class_weight="balanced",
                              solver="lbfgs").fit(X_sc, y, sample_weight=sample_weight)
@@ -471,7 +546,7 @@ def fit_both_ensembles(window_dirs, top_services, train_gs, test_gs,
         bundle_p1 = _fit_models(X1, y1, "P1", sample_weight=w1)
         bundle_p2 = _fit_models(X2, y2, "P2", sample_weight=w2) if len(X2) >= 50 else None
         if bundle_p2 is None:
-            print(f"    SKIP P2 — too few samples ({len(X2)})")
+            print(f"    SKIP P2 ({len(X2)} samples)")
         ensembles[mt] = {"p1": bundle_p1, "p2": bundle_p2}
     return ensembles
 
@@ -534,7 +609,6 @@ def predict_window(test_x, test_ts, train_x_ref, info, service, top_services,
 def run_validation(pseudo_labels, wid_map):
     print("\n>>> Building stratified holdout (10%)…")
     train_pool, holdout = stratified_holdout(all_window_dirs(), frac=0.10, seed=42)
-
     top_services = compute_top_services(train_pool)
     train_gs = compute_window_global_stats(train_pool, "train.npy")
     test_gs  = compute_window_global_stats(all_window_dirs(), "test.npy")
@@ -557,12 +631,12 @@ def run_validation(pseudo_labels, wid_map):
 
     print(">>> Cross-window LOO on holdout…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v60 FFT features (CW-LOO)")
+    print_summary_v2(rep, "v61 TDA+FFT (CW-LOO)")
     return rep
 
 
 def generate_submission(ensembles, top_services, test_gs,
-                        output=Path("submission_v60_fft_features.json")):
+                        output=Path("submission_v61_tda.json")):
     print(f"\n>>> Generating predictions on 1000 test windows…")
     preds = {}; t0 = time.time()
     for i, wdir in enumerate(all_window_dirs(), 1):
@@ -587,7 +661,8 @@ def generate_submission(ensembles, top_services, test_gs,
 
 if __name__ == "__main__":
     print(f"Pseudo-label source: {PSEUDO_SOURCE}")
-    print(f"N_FEATS_P1={N_FEATS_P1}  N_FEATS_P2={N_FEATS_P2}  FFT_K=adaptive(min(10,n//4))\n")
+    print(f"N_FEATS_P1={N_FEATS_P1}  N_FEATS_P2={N_FEATS_P2}")
+    print(f"TDA: maxdim=1, dim={TDA_DIM}, lag={TDA_LAG}, max_pts={TDA_MAX_PTS}\n")
 
     pseudo_labels = load_pseudo_labels(PSEUDO_SOURCE)
     n_with = sum(1 for v in pseudo_labels.values() if v.sum() > 0)
@@ -595,15 +670,21 @@ if __name__ == "__main__":
 
     wid_map = build_wid_map(all_window_dirs())
 
+    # Quick benchmark: how long does ripser take on a typical window?
+    _bx = np.load(list(all_window_dirs())[0] / "test.npy")
+    _t = time.time()
+    tda_window_features(_bx, _bx)
+    print(f"TDA benchmark: n={len(_bx)} → {time.time()-_t:.3f}s per window\n")
+
     rep = run_validation(pseudo_labels, wid_map)
 
     print("\n>>> Re-training on ALL windows for final submission…")
     t0 = time.time()
-    top_sv = compute_top_services(all_window_dirs())
+    top_sv   = compute_top_services(all_window_dirs())
     train_gs = compute_window_global_stats(all_window_dirs(), "train.npy")
     test_gs  = compute_window_global_stats(all_window_dirs(), "test.npy")
     ensembles = fit_both_ensembles(all_window_dirs(), top_sv, train_gs, test_gs,
                                    pseudo_labels, wid_map)
     print(f"    full fit {time.time()-t0:.1f}s")
     generate_submission(ensembles, top_sv, test_gs)
-    print("\nDone. Submit submission_v60_fft_features.json")
+    print("\nDone. Submit submission_v61_tda.json")
