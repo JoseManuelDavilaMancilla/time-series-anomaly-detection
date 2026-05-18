@@ -1,38 +1,12 @@
 """
-author v65 — Matrix Profile + multiscale rolling + FFT broadcast features.
+author v66 — Pseudo-label iteration from v65 (0.6890 LB).
 
-Inspired by friend's key insight: "when plateau hits, add features from
-different signal CLASS, not more tuning of existing ones."
+Identical architecture to v65 (105 P1 / 112 P2 features).
+Only change: PSEUDO_SOURCE updated from v62 (0.6863) to v65 (0.6890).
 
-Three new signal classes added on top of v62 base (92 feats):
+Each pseudo-label iteration gives ~+0.001 LB.
 
-1. MATRIX PROFILE — stumpy.stump at m=5,10,20 (3 per-point features)
-   Per-point distance to the nearest non-trivial subsequence match.
-   High distance = discord = anomaly. Captures motif/discord structure
-   that rolling stats fundamentally cannot — it measures "does this
-   pattern appear anywhere else in the series?"
-
-2. MULTISCALE ROLLING — add w=3,7,63 (6 per-point features)
-   We already have w=5,11,21,41. Adding extreme ends:
-   w=3  → very local noise/spikes
-   w=7  → short-burst anomalies
-   w=63 → long-range trend shifts
-   mean+std at each new window.
-
-3. FFT BROADCAST — 4 window-level scalars
-   top1_mag, top2_mag, top3_mag: magnitudes of 3 dominant frequency peaks
-   (normalized by total power). Tells model HOW periodic this window is
-   and at what dominant frequency.
-   hf_energy_ratio: fraction of power in high frequencies (>N/4).
-   High = spiky/noisy. Low = smooth/trending.
-
-N_FEATS_P1: 92 + 3 + 6 + 4 = 105
-N_FEATS_P2: 99 + 3 + 6 + 4 = 112
-
-Pseudo-labels: submission_v62_tda_cached.json (LB 0.6863).
-PSEUDO_WEIGHT: 0.70.
-
-Run:  uv run python v65_matrix_profile.py
+Run:  uv run python v66_pseudo_iter.py
 """
 
 from __future__ import annotations
@@ -74,7 +48,7 @@ N_FFT_BROAD     = 4    # top1/2/3 mag + hf_energy_ratio
 N_FEATS_P1      = 77 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_FFT_BROAD  # 105
 N_FEATS_P2      = 84 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_FFT_BROAD  # 112
 PSEUDO_WEIGHT   = 0.70
-PSEUDO_SOURCE   = Path("submission_v62_tda_cached.json")
+PSEUDO_SOURCE   = Path("submission_v65_matrix_profile.json")
 CACHE_DIR       = Path("tda_cache")
 MP_WINDOWS      = [5, 10, 20]
 EXTRA_ROLL_W    = [3, 7, 63]
@@ -566,12 +540,12 @@ def run_validation(pseudo_labels,wid_map):
                               service,top_services,ensembles,wg,_wid(window.wdir))
     print(">>> Cross-window LOO on holdout…")
     rep=cross_window_evaluate(predictor,holdout)
-    print_summary_v2(rep,"v65 matrix-profile+FFT-broad (CW-LOO)")
+    print_summary_v2(rep,"v66 pseudo-iter from v65 (CW-LOO)")
     return rep
 
 
 def generate_submission(ensembles,top_services,test_gs,
-                        output=Path("submission_v65_matrix_profile.json")):
+                        output=Path("submission_v66_pseudo_iter.json")):
     print(f"\n>>> Generating predictions on 1000 test windows…")
     preds={}; t0=time.time()
     for i,wdir in enumerate(all_window_dirs(),1):
@@ -615,4 +589,4 @@ if __name__ == "__main__":
     ensembles=fit_both_ensembles(all_window_dirs(),top_sv,train_gs,test_gs,pseudo_labels,wid_map)
     print(f"    full fit {time.time()-t0:.1f}s")
     generate_submission(ensembles,top_sv,test_gs)
-    print("\nDone. Submit submission_v65_matrix_profile.json")
+    print("\nDone. Submit submission_v66_pseudo_iter.json")
