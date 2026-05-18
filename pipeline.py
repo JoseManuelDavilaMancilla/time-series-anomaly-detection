@@ -1,11 +1,15 @@
 """
-author v47 — SPLIT_FRAC=0.80: same as v43 but smaller pseudo-test portion (20% vs 30%).
+author v48 — P2 trained on ALL windows (incl. zero-label / no-anomaly-in-last-30%).
 
-Hypothesis: giving P2 a more stable reference (80% instead of 70%) makes the
-shift features more reliable. W_SHIFT=0.30 kept from v43.
-v43 baseline: 0.6561 LB (SPLIT_FRAC=0.70).
+Key change vs v43: P2 pool builder no longer skips windows where the pseudo-test
+portion has zero positive labels. Those windows contribute all-negative examples,
+teaching P2 what a NORMAL temporal shift looks like (distribution changed, but no
+anomaly). This should reduce P2's false-positive rate and improve discrimination.
 
-Run:  uv run python v47_split80.py
+P1 is unchanged (skips zero-label windows, as always).
+W_SHIFT=0.30, SPLIT_FRAC=0.70 kept from v43.
+
+Run:  uv run python v48_p2_all_windows.py
 """
 
 from __future__ import annotations
@@ -37,7 +41,7 @@ TOP_K_SERVICES = 30
 SMOOTH_W = 5
 SMOOTH_ALPHA = 0.8
 W_SHIFT = 0.30          # blend weight for P2 shift model
-SPLIT_FRAC = 0.80       # fraction of train_x used as "reference" for P2 training
+SPLIT_FRAC = 0.70       # fraction of train_x used as "reference" for P2 training
 N_FEATS_P1 = 68
 N_FEATS_P2 = 75         # 68 + 7 shift features
 
@@ -286,6 +290,11 @@ def _build_pool_p2(window_dirs, top_services, target_mt, split_frac=SPLIT_FRAC):
 
     For each window: first split_frac = reference, last (1-split_frac) = pseudo-test.
     Shift features computed relative to the reference portion → non-trivial during training.
+
+    Unlike v43, we include ALL windows (even zero-label / no positives in pseudo-test).
+    All-negative pseudo-test slices teach P2 what normal temporal shifts look like,
+    reducing false positives when shift features fire without an actual anomaly.
+    P1 still skips zero-label windows.
     """
     Xs, ys = [], []
     for wdir in window_dirs:
@@ -296,16 +305,12 @@ def _build_pool_p2(window_dirs, top_services, target_mt, split_frac=SPLIT_FRAC):
             train_y = np.load(wdir / "train_label.npy")
         except FileNotFoundError:
             continue
-        if train_y.sum() == 0:
-            continue
         train_x = np.load(wdir / "train.npy")
         n = len(train_x)
         cut = max(10, int(n * split_frac))
         if n - cut < 5:
             continue
         pseudo_y = train_y[cut:]
-        if pseudo_y.sum() == 0:
-            continue  # need positive labels in pseudo-test portion
         ref_x = train_x[:cut]
         pseudo_x = train_x[cut:]
         try:
@@ -485,10 +490,10 @@ def run_validation(seed: int = 42):
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v47 SPLIT_FRAC=0.80 (CW-LOO)")
+    print_summary_v2(rep, "v48 P2-all-windows (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v47_split80_loo")
+    save_report(rep, "v48_p2_all_windows_loo")
     return rep, ensembles, top_services
 
 
@@ -527,4 +532,4 @@ if __name__ == "__main__":
     ensembles_full = fit_both_ensembles(all_window_dirs(), top_services_full)
     print(f"    full fit {time.time() - t0:.1f}s")
     generate_submission(ensembles_full, top_services_full,
-                        output=Path("submission_v47_split80.json"))
+                        output=Path("submission_v48_p2_all_windows.json"))
