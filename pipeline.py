@@ -1,15 +1,15 @@
 """
-author v48 — P2 trained on ALL windows (incl. zero-label / no-anomaly-in-last-30%).
+author v49 — P2 consistent reference at inference.
 
-Key change vs v43: P2 pool builder no longer skips windows where the pseudo-test
-portion has zero positive labels. Those windows contribute all-negative examples,
-teaching P2 what a NORMAL temporal shift looks like (distribution changed, but no
-anomaly). This should reduce P2's false-positive rate and improve discrimination.
+Bug fix vs v43: P2 was trained with ref_x = train_x[:70%], but at inference
+we passed the FULL train_x as ref_x. P2 never saw "shift relative to 100%
+of train" during training → inconsistent feature distribution at inference.
 
-P1 is unchanged (skips zero-label windows, as always).
-W_SHIFT=0.30, SPLIT_FRAC=0.70 kept from v43.
+Fix: at inference, P2 gets ref_x = train_x[:SPLIT_FRAC] (first 70%), matching
+what P2 saw during training. P1 is unchanged (full train_x reference, consistent
+with P1 training).
 
-Run:  uv run python v48_p2_all_windows.py
+Run:  uv run python v49_p2_consistent_ref.py
 """
 
 from __future__ import annotations
@@ -290,11 +290,6 @@ def _build_pool_p2(window_dirs, top_services, target_mt, split_frac=SPLIT_FRAC):
 
     For each window: first split_frac = reference, last (1-split_frac) = pseudo-test.
     Shift features computed relative to the reference portion → non-trivial during training.
-
-    Unlike v43, we include ALL windows (even zero-label / no positives in pseudo-test).
-    All-negative pseudo-test slices teach P2 what normal temporal shifts look like,
-    reducing false positives when shift features fire without an actual anomaly.
-    P1 still skips zero-label windows.
     """
     Xs, ys = [], []
     for wdir in window_dirs:
@@ -305,12 +300,16 @@ def _build_pool_p2(window_dirs, top_services, target_mt, split_frac=SPLIT_FRAC):
             train_y = np.load(wdir / "train_label.npy")
         except FileNotFoundError:
             continue
+        if train_y.sum() == 0:
+            continue
         train_x = np.load(wdir / "train.npy")
         n = len(train_x)
         cut = max(10, int(n * split_frac))
         if n - cut < 5:
             continue
         pseudo_y = train_y[cut:]
+        if pseudo_y.sum() == 0:
+            continue  # need positive labels in pseudo-test portion
         ref_x = train_x[:cut]
         pseudo_x = train_x[cut:]
         try:
@@ -418,7 +417,11 @@ def predict_proba_window(
     prob_p1 = _score_bundle(bundle["p1"], X1)
 
     if bundle["p2"] is not None:
-        X2 = make_features_shift(test_x, test_ts, train_x_ref, info, service, top_services)
+        # Use only first SPLIT_FRAC of train_x as P2 reference — consistent with P2
+        # training, where ref_x was always train_x[:cut] (first 70%).
+        cut = max(1, int(len(train_x_ref) * SPLIT_FRAC))
+        p2_ref = train_x_ref[:cut]
+        X2 = make_features_shift(test_x, test_ts, p2_ref, info, service, top_services)
         prob_p2 = _score_bundle(bundle["p2"], X2)
         return (1.0 - W_SHIFT) * prob_p1 + W_SHIFT * prob_p2
     return prob_p1
@@ -490,10 +493,10 @@ def run_validation(seed: int = 42):
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v48 P2-all-windows (CW-LOO)")
+    print_summary_v2(rep, "v49 P2-consistent-ref (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v48_p2_all_windows_loo")
+    save_report(rep, "v49_p2_consistent_ref_loo")
     return rep, ensembles, top_services
 
 
@@ -532,4 +535,4 @@ if __name__ == "__main__":
     ensembles_full = fit_both_ensembles(all_window_dirs(), top_services_full)
     print(f"    full fit {time.time() - t0:.1f}s")
     generate_submission(ensembles_full, top_services_full,
-                        output=Path("submission_v48_p2_all_windows.json"))
+                        output=Path("submission_v49_p2_consistent_ref.json"))
