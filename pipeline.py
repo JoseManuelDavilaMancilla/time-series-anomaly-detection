@@ -1,20 +1,31 @@
 """
-author v59 — LightGBM + multi-round pseudo-labeling.
+author v60 — FFT reconstruction error features.
 
-Two big bets combined:
-  1. Replace sklearn HGBT with LightGBM (typically stronger on tabular imbalanced data)
-  2. Compress 8 rounds of pseudo-label iteration into ONE submission slot.
-     Each round: fit → predict all test windows → new pseudo-labels → refit.
-     Previously: +0.001–0.003 per slot. Now 8 rounds in 1 slot.
+Classical approach: fit the dominant periodic components of the signal,
+then use the reconstruction error (actual - periodic_fit) as anomaly features.
+Anomalies are points that deviate from the expected periodic pattern.
 
-Changes vs v58:
-  - 5x LGBMClassifier (n_estimators=400, num_leaves=63) replaces 5x HGBT
-  - PSEUDO_WEIGHT = 0.60 (was 0.50) — labels are high-quality after 6 iterations
-  - N_ROUNDS = 8 internal pseudo-label iterations
-  - Seed pseudo-labels: submission_v58_global_ctx.json (LB 0.6847)
-  - No LOO validation: both changes are architecturally sound per NOTES_FOR_KIMI.md rule
+New features added (5 per point, +5 total):
+  - test_fft_residual      : test_x - FFT reconstruction (top-K components)
+  - test_fft_residual_z    : robust z-score of the above (within test_x)
+  - test_res_vs_train      : residual normalised by train's residual std
+                             (measures how unusual test deviations are vs train)
+  - periodicity_strength   : fraction of train_x variance captured by top-K
+                             components (broadcast scalar — how periodic is
+                             this window type)
+  - train_fft_res_std_log  : log(std of train reconstruction residuals)
+                             (broadcast scalar — scale of "normal" deviations)
 
-Run:  uv run python v59_lgbm_multirounds.py
+K = min(10, n_test // 4) — adaptive to series length.
+
+N_FEATS_P1: 77 → 82
+N_FEATS_P2: 84 → 89
+
+Base: v58 (HGBT, not LightGBM) to isolate FFT effect.
+Pseudo-labels: submission_v59_lgbm_multirounds.json (run after v59 finishes).
+If v59 not yet available, falls back to submission_v58_global_ctx.json.
+
+Run:  uv run python v60_fft_features.py
 """
 
 from __future__ import annotations
@@ -28,8 +39,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
-import lightgbm as lgb
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
@@ -37,29 +47,90 @@ warnings.filterwarnings("ignore", message="X does not have valid feature names")
 warnings.filterwarnings("ignore", category=UserWarning)
 
 from validation import all_window_dirs, load_window
+from cross_validation import cross_window_evaluate, print_summary_v2
 from validation import stratified_holdout, point_f1
 
 
 METRIC_TYPES = ("Count", "ErrorCount", "LatencySecond", "QPS",
                 "ResourceUtilizationRate", "SuccessRate")
 TOP_K_SERVICES = 30
-SMOOTH_W = 5
-SMOOTH_ALPHA = 0.8
-W_SHIFT = 0.30
-SPLIT_FRAC = 0.70
-N_FEATS_P1 = 77
-N_FEATS_P2 = 84
-PSEUDO_WEIGHT = 0.60          # up from 0.50 — labels are high-quality after v58
-PSEUDO_SOURCE = Path("submission_v58_global_ctx.json")
-N_ROUNDS = 8                  # internal pseudo-label rounds
+SMOOTH_W       = 5
+SMOOTH_ALPHA   = 0.8
+W_SHIFT        = 0.30
+SPLIT_FRAC     = 0.70
+N_FFT_FEATS    = 5
+N_FEATS_P1     = 77 + N_FFT_FEATS   # 82
+N_FEATS_P2     = 84 + N_FFT_FEATS   # 89
+PSEUDO_WEIGHT  = 0.50
+
+# v59 (LightGBM) scored 0.6834 < v58 (HGBT) 0.6847 — use v58 as pseudo-label source
+PSEUDO_SOURCE  = Path("submission_v58_global_ctx.json")
 
 
 # ─────────────────────────────────────────────
-# Global context: cross-window population stats
+# FFT reconstruction helpers
 # ─────────────────────────────────────────────
 
-def compute_window_global_stats(window_dirs, data_file: str = "train.npy") -> Dict[Path, Tuple[float, float, float]]:
-    raw: Dict[Path, Tuple[str, float, float, float]] = {}
+def _fft_reconstruct(x: np.ndarray, n_keep: int) -> np.ndarray:
+    """Reconstruct x keeping only the top n_keep non-DC frequency components."""
+    n = len(x)
+    if n < 8:
+        return np.full(n, np.mean(x))
+    X = np.fft.rfft(x)
+    mags = np.abs(X)
+    # Always keep DC; select top n_keep by magnitude among the rest
+    top = np.argsort(mags[1:])[::-1][:n_keep] + 1  # shift back past DC
+    mask = np.zeros(len(X), dtype=bool)
+    mask[0] = True
+    mask[top] = True
+    return np.fft.irfft(X * mask, n=n)
+
+
+def _fft_anomaly_features(test_x: np.ndarray, train_x: np.ndarray) -> np.ndarray:
+    """
+    5 per-point FFT features comparing test_x against its own periodic
+    reconstruction and against train_x's residual distribution.
+    """
+    n = len(test_x)
+    n_keep = max(1, min(10, n // 4))
+
+    # ── test self-reconstruction residual ──
+    test_recon   = _fft_reconstruct(test_x.astype(np.float64), n_keep)
+    test_res     = test_x.astype(np.float64) - test_recon
+
+    res_med  = float(np.median(test_res))
+    res_mad  = float(np.median(np.abs(test_res - res_med))) + 1e-9
+    test_res_z = np.clip((test_res - res_med) / (1.4826 * res_mad), -10, 10)
+
+    # ── train reconstruction residual stats (window-level scalars) ──
+    n_keep_tr    = max(1, min(10, len(train_x) // 4))
+    train_recon  = _fft_reconstruct(train_x.astype(np.float64), n_keep_tr)
+    train_res    = train_x.astype(np.float64) - train_recon
+    train_res_std = float(np.std(train_res)) + 1e-9
+
+    # periodicity strength: fraction of train variance explained by top-K
+    train_var = float(np.var(train_x)) + 1e-9
+    recon_var = float(np.var(train_recon))
+    periodicity_strength = float(np.clip(recon_var / train_var, 0.0, 1.0))
+
+    # test residual normalised by train residual scale
+    test_res_vs_train = np.clip(test_res / train_res_std, -10, 10)
+
+    return np.column_stack([
+        test_res,
+        test_res_z,
+        test_res_vs_train,
+        np.full(n, periodicity_strength),
+        np.full(n, np.log1p(train_res_std)),
+    ]).astype(np.float32)
+
+
+# ─────────────────────────────────────────────
+# Global context
+# ─────────────────────────────────────────────
+
+def compute_window_global_stats(window_dirs, data_file="train.npy"):
+    raw = {}
     for wdir in window_dirs:
         info = json.loads((wdir / "info.json").read_text())
         mt = info.get("metric_type", "Unknown")
@@ -69,171 +140,119 @@ def compute_window_global_stats(window_dirs, data_file: str = "train.npy") -> Di
             x = np.load(wdir / "train.npy").astype(np.float64)
         raw[wdir] = (mt, float(np.mean(x)), float(np.std(x)), float(np.max(x)))
 
-    by_mt: Dict[str, List] = defaultdict(list)
+    by_mt = defaultdict(list)
     for wdir, (mt, m, s, mx) in raw.items():
         by_mt[mt].append((wdir, m, s, mx))
 
-    result: Dict[Path, Tuple[float, float, float]] = {}
+    result = {}
     for mt, entries in by_mt.items():
         wdirs = [e[0] for e in entries]
         means = np.array([e[1] for e in entries])
         stds  = np.array([e[2] for e in entries])
         maxs  = np.array([e[3] for e in entries])
 
-        def _zscore(arr: np.ndarray) -> np.ndarray:
+        def _z(arr):
             mu, sigma = arr.mean(), arr.std()
             return np.clip((arr - mu) / (sigma + 1e-9), -5.0, 5.0)
 
-        mz = _zscore(means)
-        sz = _zscore(stds)
-        xz = _zscore(maxs)
         for i, wdir in enumerate(wdirs):
-            result[wdir] = (float(mz[i]), float(sz[i]), float(xz[i]))
-
+            result[wdir] = (float(_z(means)[i]), float(_z(stds)[i]), float(_z(maxs)[i]))
     return result
 
 
 # ─────────────────────────────────────────────
-# Rolling helpers — all centered
+# Rolling helpers (identical to v58)
 # ─────────────────────────────────────────────
 
-def _rolling_mean_std(x: np.ndarray, w: int) -> Tuple[np.ndarray, np.ndarray]:
+def _rolling_mean_std(x, w):
     import pandas as pd
     s = pd.Series(x.astype(np.float64))
     r = s.rolling(w, center=True, min_periods=1)
     return r.mean().to_numpy(), r.std(ddof=0).fillna(0.0).to_numpy()
 
-
-def _rolling_minmax(x: np.ndarray, w: int) -> Tuple[np.ndarray, np.ndarray]:
+def _rolling_minmax(x, w):
     import pandas as pd
     s = pd.Series(x.astype(np.float64))
     r = s.rolling(w, center=True, min_periods=1)
     return r.min().to_numpy(), r.max().to_numpy()
 
-
-def _rolling_median_mad(x: np.ndarray, w: int) -> Tuple[np.ndarray, np.ndarray]:
-    half = w // 2
-    n = len(x)
-    med = np.empty(n)
-    mad = np.empty(n)
+def _rolling_median_mad(x, w):
+    half = w // 2; n = len(x)
+    med = np.empty(n); mad = np.empty(n)
     for i in range(n):
-        start, end = max(0, i - half), min(n, i + half + 1)
-        seg = x[start:end]
-        m = np.median(seg)
-        med[i] = m
-        mad[i] = np.median(np.abs(seg - m))
+        seg = x[max(0, i-half):min(n, i+half+1)]
+        m = np.median(seg); med[i] = m; mad[i] = np.median(np.abs(seg - m))
     return med, mad
 
-
-def _ewma(x: np.ndarray, alpha: float = 0.3) -> np.ndarray:
-    out = np.empty_like(x, dtype=np.float64)
-    e = float(x[0])
+def _ewma(x, alpha=0.3):
+    out = np.empty_like(x, dtype=np.float64); e = float(x[0])
     for i, v in enumerate(x):
-        e = alpha * float(v) + (1 - alpha) * e
-        out[i] = e
+        e = alpha * float(v) + (1 - alpha) * e; out[i] = e
     return out
 
+def _percentile_rank_vs(values, reference):
+    ref_sorted = np.sort(reference); n_ref = len(ref_sorted)
+    if n_ref == 0: return np.full(len(values), 0.5)
+    return np.searchsorted(ref_sorted, values, side="right").astype(np.float64) / n_ref
 
-def _percentile_rank_vs(values: np.ndarray, reference: np.ndarray) -> np.ndarray:
-    ref_sorted = np.sort(reference)
-    n_ref = len(ref_sorted)
-    if n_ref == 0:
-        return np.full(len(values), 0.5)
-    idx = np.searchsorted(ref_sorted, values, side="right")
-    return idx.astype(np.float64) / n_ref
-
-
-def _time_features(timestamps: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    n = len(timestamps)
-    tod = np.empty(n, dtype=np.float64)
-    dow = np.empty(n, dtype=np.float64)
+def _time_features(timestamps):
+    n = len(timestamps); tod = np.empty(n); dow = np.empty(n)
     for i, t in enumerate(timestamps):
         d = datetime.fromtimestamp(int(t), tz=timezone.utc)
-        tod[i] = (d.hour + d.minute / 60.0 + d.second / 3600.0) / 24.0
+        tod[i] = (d.hour + d.minute/60 + d.second/3600) / 24
         dow[i] = d.weekday() / 7.0
     return tod, dow
 
-
-def parse_service(case_name: str) -> str:
-    if "##" in case_name:
-        prefix = case_name.split("##", 1)[0]
-    else:
-        prefix = case_name
-    if "_" in prefix:
-        parts = prefix.split("_", 1)
-        return parts[1] if len(parts) > 1 else prefix
-    return prefix
+def parse_service(case_name):
+    prefix = case_name.split("##", 1)[0] if "##" in case_name else case_name
+    parts = prefix.split("_", 1)
+    return parts[1] if len(parts) > 1 and "_" in prefix else prefix
 
 
 # ─────────────────────────────────────────────
-# Feature builders (identical to v58)
+# Feature builders (+5 FFT features appended)
 # ─────────────────────────────────────────────
 
-def make_features(
-    x: np.ndarray, timestamps: np.ndarray, train_x_ref: np.ndarray,
-    info: dict, service: str, top_services: List[str],
-    win_global: Tuple[float, float, float] = (0.0, 0.0, 0.0),
-) -> np.ndarray:
-    """77-feature P1 matrix (identical to v58)."""
-    n = len(x)
-    feats = []
-
+def _base77(x, timestamps, train_x_ref, info, service, top_services, win_global):
+    """77 features identical to v58."""
+    n = len(x); feats = []
     median = float(np.median(train_x_ref))
-    mad = float(np.median(np.abs(train_x_ref - median))) + 1e-9
-    mu = float(np.mean(train_x_ref))
-    sd = float(np.std(train_x_ref)) + 1e-9
+    mad    = float(np.median(np.abs(train_x_ref - median))) + 1e-9
+    mu     = float(np.mean(train_x_ref))
+    sd     = float(np.std(train_x_ref)) + 1e-9
 
-    feats.append(x.astype(np.float64))
-    feats.append((x - median) / (1.4826 * mad))
-    feats.append((x - mu) / sd)
-    feats.append(np.diff(x, prepend=x[0]))
-    feats.append(np.diff(x, n=2, prepend=[x[0], x[0]]))
+    feats += [x.astype(np.float64),
+              (x - median) / (1.4826 * mad),
+              (x - mu) / sd,
+              np.diff(x, prepend=x[0]),
+              np.diff(x, n=2, prepend=[x[0], x[0]])]
 
     for w in (5, 11, 21):
-        m, s = _rolling_mean_std(x, w)
-        feats.append(m)
-        feats.append(s)
+        m, s = _rolling_mean_std(x, w); feats += [m, s]
 
     rmed11, rmad11 = _rolling_median_mad(x, 11)
-    feats.append(rmed11)
-    feats.append(rmad11)
-    feats.append(x - rmed11)
-    feats.append((x - rmed11) / (1.4826 * rmad11 + 1e-9))
+    feats += [rmed11, rmad11, x - rmed11, (x - rmed11) / (1.4826 * rmad11 + 1e-9)]
 
-    ewma = _ewma(x, alpha=0.3)
-    res = x - ewma
-    feats.append(ewma)
-    feats.append(res)
-    feats.append(res / (np.std(res) + 1e-9))
+    ewma = _ewma(x); res = x - ewma
+    feats += [ewma, res, res / (np.std(res) + 1e-9)]
+    feats += [_percentile_rank_vs(x, train_x_ref),
+              np.arange(n, dtype=np.float64) / max(1, n - 1)]
 
-    feats.append(_percentile_rank_vs(x, train_x_ref))
-    feats.append(np.arange(n, dtype=np.float64) / max(1, n - 1))
-
-    tod, dow = _time_features(timestamps)
-    feats.append(tod)
-    feats.append(dow)
+    tod, dow = _time_features(timestamps); feats += [tod, dow]
 
     rmean41, rstd41 = _rolling_mean_std(x, 41)
-    feats.append(rmean41)
-    feats.append(rstd41)
-    rmed41, rmad41 = _rolling_median_mad(x, 41)
-    feats.append(rmed41)
-    feats.append(rmad41)
+    rmed41, rmad41  = _rolling_median_mad(x, 41)
     _, rs5 = _rolling_mean_std(x, 5)
-    feats.append(rs5 / (rstd41 + 1e-9))
-    rmin11, rmax11 = _rolling_minmax(x, 11)
-    feats.append(rmax11 - x)
-    feats.append(x - rmin11)
+    feats += [rmean41, rstd41, rmed41, rmad41, rs5 / (rstd41 + 1e-9)]
 
+    rmin11, rmax11 = _rolling_minmax(x, 11)
+    feats += [rmax11 - x, x - rmin11]
     for w_mm in (5, 21, 41):
         rmin_w, rmax_w = _rolling_minmax(x, w_mm)
-        feats.append(rmax_w - x)
-        feats.append(x - rmin_w)
+        feats += [rmax_w - x, x - rmin_w]
 
-    mean_z, std_z, max_z = win_global
-    feats.append(np.full(n, mean_z, dtype=np.float64))
-    feats.append(np.full(n, std_z,  dtype=np.float64))
-    feats.append(np.full(n, max_z,  dtype=np.float64))
+    mz, sz, xz = win_global
+    feats += [np.full(n, mz), np.full(n, sz), np.full(n, xz)]
 
     static = []
     mt = info.get("metric_type", "Unknown")
@@ -242,50 +261,48 @@ def make_features(
     for ts in top_services:
         static.append(1.0 if service == ts else 0.0)
     static += [0.0] * (TOP_K_SERVICES - len(top_services))
-    static.append(float(info.get("intervals", 0)) / 3600.0)
-    static.append(float(info.get("training set anomaly ratio", 0.0)))
-    static.append(float(info.get("test set anomaly ratio", 0.0)))
+    static += [float(info.get("intervals", 0)) / 3600.0,
+               float(info.get("training set anomaly ratio", 0.0)),
+               float(info.get("test set anomaly ratio", 0.0))]
 
-    static_arr = np.array(static, dtype=np.float64)
-    feats_static = np.tile(static_arr, (n, 1))
-    point_feats = np.column_stack(feats)
+    point_feats   = np.column_stack(feats)
+    feats_static  = np.tile(np.array(static, dtype=np.float64), (n, 1))
     return np.hstack([point_feats, feats_static]).astype(np.float32)
 
 
-def make_features_shift(
-    x: np.ndarray, timestamps: np.ndarray, ref_x: np.ndarray,
-    info: dict, service: str, top_services: List[str],
-    win_global: Tuple[float, float, float] = (0.0, 0.0, 0.0),
-) -> np.ndarray:
-    """84-feature P2 matrix (identical to v58)."""
+def make_features(x, timestamps, train_x_ref, info, service, top_services,
+                  win_global=(0., 0., 0.)):
+    """82-feature P1 matrix = 77 base + 5 FFT."""
+    base = _base77(x, timestamps, train_x_ref, info, service, top_services, win_global)
+    fft  = _fft_anomaly_features(x, train_x_ref)
+    return np.hstack([base, fft])
+
+
+def make_features_shift(x, timestamps, ref_x, info, service, top_services,
+                        win_global=(0., 0., 0.)):
+    """89-feature P2 matrix = 82 + 7 shift."""
     base = make_features(x, timestamps, ref_x, info, service, top_services, win_global)
     n = len(x)
-
-    x_med = float(np.median(x))
-    x_mad = float(np.median(np.abs(x - x_med))) + 1e-9
+    x_med = float(np.median(x)); x_mad = float(np.median(np.abs(x - x_med))) + 1e-9
     ref_std = float(np.std(ref_x)) + 1e-9
 
-    rank_in_self    = _percentile_rank_vs(x, x)
-    self_robust_z   = (x - x_med) / (1.4826 * x_mad)
-    above_ref_max   = np.maximum(0.0, x - float(np.max(ref_x)))
-    below_ref_min   = np.maximum(0.0, float(np.min(ref_x)) - x)
-    mean_shift_bc   = np.full(n, float(np.mean(x)) - float(np.mean(ref_x)))
-    std_ratio_bc    = np.full(n, float(np.std(x)) / ref_std)
-    median_shift_bc = np.full(n, float(np.median(x)) - float(np.median(ref_x)))
-
-    shift_feats = np.column_stack([
-        rank_in_self, self_robust_z, above_ref_max, below_ref_min,
-        mean_shift_bc, std_ratio_bc, median_shift_bc,
+    shift = np.column_stack([
+        _percentile_rank_vs(x, x),
+        (x - x_med) / (1.4826 * x_mad),
+        np.maximum(0., x - float(np.max(ref_x))),
+        np.maximum(0., float(np.min(ref_x)) - x),
+        np.full(n, float(np.mean(x)) - float(np.mean(ref_x))),
+        np.full(n, float(np.std(x)) / ref_std),
+        np.full(n, float(np.median(x)) - float(np.median(ref_x))),
     ]).astype(np.float32)
-
-    return np.hstack([base, shift_feats])
+    return np.hstack([base, shift])
 
 
 # ─────────────────────────────────────────────
-# Top-30 services
+# Top services
 # ─────────────────────────────────────────────
 
-def compute_top_services(window_dirs, k: int = TOP_K_SERVICES) -> List[str]:
+def compute_top_services(window_dirs, k=TOP_K_SERVICES):
     counts = Counter()
     for wdir in window_dirs:
         info = json.loads((wdir / "info.json").read_text())
@@ -297,17 +314,14 @@ def compute_top_services(window_dirs, k: int = TOP_K_SERVICES) -> List[str]:
 # Pseudo-label helpers
 # ─────────────────────────────────────────────
 
-def load_pseudo_labels(path: Path) -> Dict[str, np.ndarray]:
+def load_pseudo_labels(path):
     data = json.loads(path.read_text())
-    return {wid: np.array(v, dtype=np.int64)
-            for wid, v in data["predictions"].items()}
+    return {wid: np.array(v, dtype=np.int64) for wid, v in data["predictions"].items()}
 
-
-def build_wid_map(window_dirs) -> Dict[str, Path]:
+def build_wid_map(window_dirs):
     return {wdir.name.split("_", 1)[0]: wdir for wdir in window_dirs}
 
-
-def _load_test_arrays(wdir: Path, info: dict):
+def _load_test_arrays(wdir, info):
     test_x = np.load(wdir / "test.npy")
     try:
         test_ts = np.load(wdir / "test_timestamp.npy")
@@ -317,207 +331,147 @@ def _load_test_arrays(wdir: Path, info: dict):
 
 
 # ─────────────────────────────────────────────
-# Training pool builders (identical to v58)
+# Pool builders
 # ─────────────────────────────────────────────
 
 def _build_pool_p1(window_dirs, top_services, target_mt,
-                   train_global_stats, test_global_stats,
-                   pseudo_labels=None, wid_map=None):
-    Xs, ys, sample_ws = [], [], []
-
+                   train_gs, test_gs, pseudo_labels=None, wid_map=None):
+    Xs, ys, ws = [], [], []
     for wdir in window_dirs:
         info = json.loads((wdir / "info.json").read_text())
-        if info.get("metric_type") != target_mt:
-            continue
+        if info.get("metric_type") != target_mt: continue
         try:
             train_y = np.load(wdir / "train_label.npy")
-        except FileNotFoundError:
-            continue
-        if train_y.sum() == 0:
-            continue
+        except FileNotFoundError: continue
+        if train_y.sum() == 0: continue
         train_x = np.load(wdir / "train.npy")
         try:
             train_ts = np.load(wdir / "train_timestamp.npy")
         except FileNotFoundError:
             train_ts = np.arange(len(train_x), dtype=np.int64) * info.get("intervals", 60)
         service = parse_service(info.get("case_name", ""))
-        wg = train_global_stats.get(wdir, (0.0, 0.0, 0.0))
-        feats = make_features(train_x, train_ts, train_x, info, service, top_services, wg)
-        Xs.append(feats)
+        wg = train_gs.get(wdir, (0., 0., 0.))
+        Xs.append(make_features(train_x, train_ts, train_x, info, service, top_services, wg))
         ys.append(train_y)
-        sample_ws.append(np.ones(len(train_y), dtype=np.float32))
+        ws.append(np.ones(len(train_y), dtype=np.float32))
 
     if pseudo_labels and wid_map:
         for wid, pseudo_y in pseudo_labels.items():
-            if pseudo_y.sum() == 0:
-                continue
+            if pseudo_y.sum() == 0: continue
             wdir = wid_map.get(wid)
-            if wdir is None:
-                continue
+            if wdir is None: continue
             info = json.loads((wdir / "info.json").read_text())
-            if info.get("metric_type") != target_mt:
-                continue
+            if info.get("metric_type") != target_mt: continue
             train_x = np.load(wdir / "train.npy")
             test_x, test_ts = _load_test_arrays(wdir, info)
-            if len(test_x) != len(pseudo_y):
-                continue
+            if len(test_x) != len(pseudo_y): continue
             service = parse_service(info.get("case_name", ""))
-            wg = test_global_stats.get(wdir, (0.0, 0.0, 0.0))
-            feats = make_features(test_x, test_ts, train_x, info, service, top_services, wg)
-            Xs.append(feats)
+            wg = test_gs.get(wdir, (0., 0., 0.))
+            Xs.append(make_features(test_x, test_ts, train_x, info, service, top_services, wg))
             ys.append(pseudo_y)
-            sample_ws.append(np.full(len(pseudo_y), PSEUDO_WEIGHT, dtype=np.float32))
+            ws.append(np.full(len(pseudo_y), PSEUDO_WEIGHT, dtype=np.float32))
 
     if not Xs:
-        return (np.zeros((0, N_FEATS_P1), np.float32),
-                np.zeros(0, np.int64), np.zeros(0, np.float32))
-    return np.vstack(Xs), np.hstack(ys), np.hstack(sample_ws)
+        return np.zeros((0, N_FEATS_P1), np.float32), np.zeros(0, np.int64), np.zeros(0, np.float32)
+    return np.vstack(Xs), np.hstack(ys), np.hstack(ws)
 
 
 def _build_pool_p2(window_dirs, top_services, target_mt,
-                   train_global_stats, test_global_stats,
-                   split_frac=SPLIT_FRAC, pseudo_labels=None, wid_map=None):
-    Xs, ys, sample_ws = [], [], []
-
+                   train_gs, test_gs, pseudo_labels=None, wid_map=None):
+    Xs, ys, ws = [], [], []
     for wdir in window_dirs:
         info = json.loads((wdir / "info.json").read_text())
-        if info.get("metric_type") != target_mt:
-            continue
+        if info.get("metric_type") != target_mt: continue
         try:
             train_y = np.load(wdir / "train_label.npy")
-        except FileNotFoundError:
-            continue
-        if train_y.sum() == 0:
-            continue
+        except FileNotFoundError: continue
+        if train_y.sum() == 0: continue
         train_x = np.load(wdir / "train.npy")
-        n = len(train_x)
-        cut = max(10, int(n * split_frac))
-        if n - cut < 5:
-            continue
+        n = len(train_x); cut = max(10, int(n * SPLIT_FRAC))
+        if n - cut < 5: continue
         pseudo_y_split = train_y[cut:]
-        if pseudo_y_split.sum() == 0:
-            continue
-        ref_x = train_x[:cut]
-        pseudo_x = train_x[cut:]
+        if pseudo_y_split.sum() == 0: continue
+        ref_x = train_x[:cut]; pseudo_x = train_x[cut:]
         try:
             train_ts = np.load(wdir / "train_timestamp.npy")
         except FileNotFoundError:
             train_ts = np.arange(n, dtype=np.int64) * info.get("intervals", 60)
-        pseudo_ts = train_ts[cut:]
         service = parse_service(info.get("case_name", ""))
-        wg = train_global_stats.get(wdir, (0.0, 0.0, 0.0))
-        feats = make_features_shift(pseudo_x, pseudo_ts, ref_x, info, service, top_services, wg)
-        Xs.append(feats)
+        wg = train_gs.get(wdir, (0., 0., 0.))
+        Xs.append(make_features_shift(pseudo_x, train_ts[cut:], ref_x, info, service, top_services, wg))
         ys.append(pseudo_y_split)
-        sample_ws.append(np.ones(len(pseudo_y_split), dtype=np.float32))
+        ws.append(np.ones(len(pseudo_y_split), dtype=np.float32))
 
     if pseudo_labels and wid_map:
         for wid, pseudo_y in pseudo_labels.items():
-            if pseudo_y.sum() == 0:
-                continue
+            if pseudo_y.sum() == 0: continue
             wdir = wid_map.get(wid)
-            if wdir is None:
-                continue
+            if wdir is None: continue
             info = json.loads((wdir / "info.json").read_text())
-            if info.get("metric_type") != target_mt:
-                continue
+            if info.get("metric_type") != target_mt: continue
             train_x = np.load(wdir / "train.npy")
-            cut = max(1, int(len(train_x) * split_frac))
+            cut = max(1, int(len(train_x) * SPLIT_FRAC))
             ref_x = train_x[:cut]
             test_x, test_ts = _load_test_arrays(wdir, info)
-            if len(test_x) != len(pseudo_y) or len(test_x) < 5:
-                continue
+            if len(test_x) != len(pseudo_y) or len(test_x) < 5: continue
             service = parse_service(info.get("case_name", ""))
-            wg = test_global_stats.get(wdir, (0.0, 0.0, 0.0))
-            feats = make_features_shift(test_x, test_ts, ref_x, info, service, top_services, wg)
-            Xs.append(feats)
+            wg = test_gs.get(wdir, (0., 0., 0.))
+            Xs.append(make_features_shift(test_x, test_ts, ref_x, info, service, top_services, wg))
             ys.append(pseudo_y)
-            sample_ws.append(np.full(len(pseudo_y), PSEUDO_WEIGHT, dtype=np.float32))
+            ws.append(np.full(len(pseudo_y), PSEUDO_WEIGHT, dtype=np.float32))
 
     if not Xs:
-        return (np.zeros((0, N_FEATS_P2), np.float32),
-                np.zeros(0, np.int64), np.zeros(0, np.float32))
-    return np.vstack(Xs), np.hstack(ys), np.hstack(sample_ws)
+        return np.zeros((0, N_FEATS_P2), np.float32), np.zeros(0, np.int64), np.zeros(0, np.float32)
+    return np.vstack(Xs), np.hstack(ys), np.hstack(ws)
 
 
 # ─────────────────────────────────────────────
-# Ensemble fitting — LightGBM replaces HGBT
+# Ensemble (identical HGBT+RF+LR blend as v58)
 # ─────────────────────────────────────────────
 
-def _fit_models(X: np.ndarray, y: np.ndarray, label: str,
-                sample_weight: np.ndarray | None = None) -> dict:
+def _fit_models(X, y, label, sample_weight=None):
     scaler = StandardScaler().fit(X)
-    X_scaled = scaler.transform(X)
+    X_sc = scaler.transform(X)
 
     t0 = time.time()
-    rfs = []
-    for s in (0, 1, 2):
-        rf = RandomForestClassifier(
-            n_estimators=200, max_depth=15, min_samples_leaf=10,
-            class_weight="balanced", random_state=s, n_jobs=4,
-        )
-        rf.fit(X, y, sample_weight=sample_weight)
-        rfs.append(rf)
-    print(f"    {label} 3-seed RF fit {time.time() - t0:.1f}s")
-
-    # LightGBM: replaces sklearn HGBT
-    t0 = time.time()
-    lgbms = []
-    for s in range(5):
-        model = lgb.LGBMClassifier(
-            n_estimators=400,
-            learning_rate=0.05,
-            num_leaves=63,
-            max_depth=8,
-            min_child_samples=20,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            class_weight="balanced",
-            n_jobs=4,
-            verbose=-1,
-            random_state=s,
-        )
-        model.fit(X, y, sample_weight=sample_weight)
-        lgbms.append(model)
-    print(f"    {label} 5-seed LGB fit {time.time() - t0:.1f}s")
+    rfs = [RandomForestClassifier(n_estimators=200, max_depth=15, min_samples_leaf=10,
+                                   class_weight="balanced", random_state=s, n_jobs=4).fit(
+                                       X, y, sample_weight=sample_weight)
+           for s in (0, 1, 2)]
+    print(f"    {label} 3-seed RF  {time.time()-t0:.1f}s")
 
     t0 = time.time()
-    lr = LogisticRegression(C=0.5, max_iter=500, class_weight="balanced", solver="lbfgs")
-    lr.fit(X_scaled, y, sample_weight=sample_weight)
-    print(f"    {label} 1 LR fit {time.time() - t0:.1f}s")
+    hgbts = [HistGradientBoostingClassifier(max_iter=200, max_depth=8, learning_rate=0.05,
+                                             min_samples_leaf=20, random_state=s,
+                                             class_weight="balanced").fit(
+                                                 X, y, sample_weight=sample_weight)
+             for s in range(5)]
+    print(f"    {label} 5-seed HGBT {time.time()-t0:.1f}s")
 
-    return {"rfs": rfs, "lgbms": lgbms, "lr": lr, "scaler": scaler}
+    t0 = time.time()
+    lr = LogisticRegression(C=0.5, max_iter=500, class_weight="balanced",
+                             solver="lbfgs").fit(X_sc, y, sample_weight=sample_weight)
+    print(f"    {label} 1 LR        {time.time()-t0:.1f}s")
+    return {"rfs": rfs, "hgbts": hgbts, "lr": lr, "scaler": scaler}
 
 
-def fit_both_ensembles(window_dirs, top_services,
-                       train_global_stats, test_global_stats,
-                       pseudo_labels=None, wid_map=None) -> Dict[str, dict]:
-    ensembles: Dict[str, dict] = {}
+def fit_both_ensembles(window_dirs, top_services, train_gs, test_gs,
+                       pseudo_labels=None, wid_map=None):
+    ensembles = {}
     for mt in METRIC_TYPES:
         print(f"  [{mt}] building pools…", flush=True)
         t0 = time.time()
-        X1, y1, w1 = _build_pool_p1(window_dirs, top_services, mt,
-                                     train_global_stats, test_global_stats,
-                                     pseudo_labels, wid_map)
-        X2, y2, w2 = _build_pool_p2(window_dirs, top_services, mt,
-                                     train_global_stats, test_global_stats,
-                                     pseudo_labels=pseudo_labels, wid_map=wid_map)
-
+        X1, y1, w1 = _build_pool_p1(window_dirs, top_services, mt, train_gs, test_gs, pseudo_labels, wid_map)
+        X2, y2, w2 = _build_pool_p2(window_dirs, top_services, mt, train_gs, test_gs, pseudo_labels, wid_map)
         print(f"    P1 X={X1.shape} pos={y1.mean():.3f}  "
               f"P2 X={X2.shape} pos={y2.mean() if len(y2) else 0:.3f}  "
               f"build={time.time()-t0:.1f}s")
-
         if len(X1) < 100:
-            print(f"    SKIP P1 — too few samples")
-            continue
-
+            print(f"    SKIP P1"); continue
         bundle_p1 = _fit_models(X1, y1, "P1", sample_weight=w1)
-        bundle_p2 = None
-        if len(X2) >= 50:
-            bundle_p2 = _fit_models(X2, y2, "P2", sample_weight=w2)
-        else:
+        bundle_p2 = _fit_models(X2, y2, "P2", sample_weight=w2) if len(X2) >= 50 else None
+        if bundle_p2 is None:
             print(f"    SKIP P2 — too few samples ({len(X2)})")
-
         ensembles[mt] = {"p1": bundle_p1, "p2": bundle_p2}
     return ensembles
 
@@ -526,163 +480,130 @@ def fit_both_ensembles(window_dirs, top_services,
 # Inference
 # ─────────────────────────────────────────────
 
-def _score_bundle(bundle: dict, X: np.ndarray) -> np.ndarray:
-    X_scaled = bundle["scaler"].transform(X)
-    rf_avg   = np.mean([clf.predict_proba(X)[:, 1] for clf in bundle["rfs"]], axis=0)
-    lgb_avg  = np.mean([clf.predict_proba(X)[:, 1] for clf in bundle["lgbms"]], axis=0)
-    lr_p     = bundle["lr"].predict_proba(X_scaled)[:, 1]
-    return 0.80 * lgb_avg + 0.10 * rf_avg + 0.10 * lr_p
+def _score_bundle(bundle, X):
+    X_sc = bundle["scaler"].transform(X)
+    rf_avg   = np.mean([c.predict_proba(X)[:, 1] for c in bundle["rfs"]], axis=0)
+    hgbt_avg = np.mean([c.predict_proba(X)[:, 1] for c in bundle["hgbts"]], axis=0)
+    lr_p     = bundle["lr"].predict_proba(X_sc)[:, 1]
+    return 0.80 * hgbt_avg + 0.10 * rf_avg + 0.10 * lr_p
 
 
-def predict_proba_window(
-    test_x, test_ts, train_x_ref, info, service, top_services, ensembles,
-    win_global=(0.0, 0.0, 0.0),
-) -> np.ndarray:
+def predict_proba_window(test_x, test_ts, train_x_ref, info, service,
+                          top_services, ensembles, win_global=(0., 0., 0.)):
     mt = info.get("metric_type", "Unknown")
-    if mt not in ensembles:
-        mt = next(iter(ensembles))
+    if mt not in ensembles: mt = next(iter(ensembles))
     bundle = ensembles[mt]
-
     X1 = make_features(test_x, test_ts, train_x_ref, info, service, top_services, win_global)
-    prob_p1 = _score_bundle(bundle["p1"], X1)
-
+    p1 = _score_bundle(bundle["p1"], X1)
     if bundle["p2"] is not None:
         X2 = make_features_shift(test_x, test_ts, train_x_ref, info, service, top_services, win_global)
-        prob_p2 = _score_bundle(bundle["p2"], X2)
-        return (1.0 - W_SHIFT) * prob_p1 + W_SHIFT * prob_p2
-    return prob_p1
+        p2 = _score_bundle(bundle["p2"], X2)
+        return (1. - W_SHIFT) * p1 + W_SHIFT * p2
+    return p1
 
 
-def smooth_centered(p: np.ndarray, w: int = SMOOTH_W) -> np.ndarray:
-    if w <= 1:
-        return p.copy()
-    kernel = np.ones(w) / w
-    half = w // 2
-    padded = np.concatenate([
-        p[half - 1 :: -1] if half > 0 else p[:0],
-        p,
-        p[-1 : -half - 1 : -1] if half > 0 else p[:0],
-    ])
+def smooth_centered(p, w=SMOOTH_W):
+    if w <= 1: return p.copy()
+    kernel = np.ones(w) / w; half = w // 2
+    padded = np.concatenate([p[half-1::-1] if half > 0 else p[:0], p,
+                             p[-1:-half-1:-1] if half > 0 else p[:0]])
     out = np.convolve(padded, kernel, mode="valid")
-    if len(out) > len(p):
-        out = out[: len(p)]
-    elif len(out) < len(p):
-        out = np.convolve(p, kernel, mode="same")
+    if len(out) > len(p): out = out[:len(p)]
+    elif len(out) < len(p): out = np.convolve(p, kernel, mode="same")
     return out
 
 
 def predict_window(test_x, test_ts, train_x_ref, info, service, top_services,
-                   ensembles, win_global=(0.0, 0.0, 0.0)) -> np.ndarray:
+                   ensembles, win_global=(0., 0., 0.)):
     n = len(test_x)
-    ratio = float(info.get("test set anomaly ratio", 0.0))
-    k = max(0, min(int(round(n * ratio)), n))
-    if k == 0:
-        return np.zeros(n, dtype=int)
-
-    prob_mean = predict_proba_window(test_x, test_ts, train_x_ref, info, service,
-                                     top_services, ensembles, win_global)
-    rm = smooth_centered(prob_mean, SMOOTH_W)
-    prob_final = (1.0 - SMOOTH_ALPHA) * prob_mean + SMOOTH_ALPHA * rm
-
-    order = np.lexsort((np.arange(n), -prob_final))
-    pred = np.zeros(n, dtype=int)
-    pred[order[:k]] = 1
+    k = max(0, min(int(round(n * float(info.get("test set anomaly ratio", 0.)))), n))
+    if k == 0: return np.zeros(n, dtype=int)
+    prob = predict_proba_window(test_x, test_ts, train_x_ref, info, service,
+                                top_services, ensembles, win_global)
+    rm = smooth_centered(prob, SMOOTH_W)
+    prob_f = (1. - SMOOTH_ALPHA) * prob + SMOOTH_ALPHA * rm
+    order = np.lexsort((np.arange(n), -prob_f))
+    pred = np.zeros(n, dtype=int); pred[order[:k]] = 1
     return pred
 
 
 # ─────────────────────────────────────────────
-# Multi-round pseudo-label loop
+# Validation + submission
 # ─────────────────────────────────────────────
 
-def predict_all_test_windows(ensembles, top_services, test_global_stats,
-                              window_dirs) -> Dict[str, np.ndarray]:
-    """Score all test windows and return binary predictions."""
-    preds = {}
-    for wdir in window_dirs:
+def run_validation(pseudo_labels, wid_map):
+    print("\n>>> Building stratified holdout (10%)…")
+    train_pool, holdout = stratified_holdout(all_window_dirs(), frac=0.10, seed=42)
+
+    top_services = compute_top_services(train_pool)
+    train_gs = compute_window_global_stats(train_pool, "train.npy")
+    test_gs  = compute_window_global_stats(all_window_dirs(), "test.npy")
+
+    print(">>> Fitting P1+P2 ensembles…")
+    t0 = time.time()
+    ensembles = fit_both_ensembles(train_pool, top_services, train_gs, test_gs,
+                                   pseudo_labels, wid_map)
+    print(f"    fit {time.time()-t0:.1f}s")
+
+    def predictor(window):
+        try:
+            train_ts = np.load(window.wdir / "train_timestamp.npy")
+        except FileNotFoundError:
+            train_ts = np.arange(len(window.train_x)) * window.info.get("intervals", 60)
+        service = parse_service(window.info.get("case_name", ""))
+        wg = train_gs.get(window.wdir, (0., 0., 0.))
+        return predict_window(window.train_x, train_ts, window.train_x, window.info,
+                              service, top_services, ensembles, wg)
+
+    print(">>> Cross-window LOO on holdout…")
+    rep = cross_window_evaluate(predictor, holdout)
+    print_summary_v2(rep, "v60 FFT features (CW-LOO)")
+    return rep
+
+
+def generate_submission(ensembles, top_services, test_gs,
+                        output=Path("submission_v60_fft_features.json")):
+    print(f"\n>>> Generating predictions on 1000 test windows…")
+    preds = {}; t0 = time.time()
+    for i, wdir in enumerate(all_window_dirs(), 1):
         w = load_window(wdir)
         try:
             test_ts = np.load(wdir / "test_timestamp.npy")
         except FileNotFoundError:
-            test_ts = np.arange(len(w.test_x), dtype=np.int64) * w.info.get("intervals", 60)
+            test_ts = np.arange(len(w.test_x)) * w.info.get("intervals", 60)
         service = parse_service(w.info.get("case_name", ""))
-        wg = test_global_stats.get(wdir, (0.0, 0.0, 0.0))
+        wg = test_gs.get(wdir, (0., 0., 0.))
         pred = predict_window(w.test_x, test_ts, w.train_x, w.info,
                               service, top_services, ensembles, wg)
-        preds[w.wid] = pred
-    return preds
-
-
-def run_multirounds():
-    all_wdirs = list(all_window_dirs())
-    wid_map = build_wid_map(all_wdirs)
-
-    print(">>> Pre-computing shared stats (done once)…")
-    top_services = compute_top_services(all_wdirs, k=TOP_K_SERVICES)
-    train_gs = compute_window_global_stats(all_wdirs, data_file="train.npy")
-    test_gs  = compute_window_global_stats(all_wdirs, data_file="test.npy")
-    print(f"    top_services={len(top_services)}  "
-          f"train_gs={len(train_gs)}  test_gs={len(test_gs)}")
-
-    print(f"\n>>> Loading seed pseudo-labels from {PSEUDO_SOURCE}…")
-    pseudo_labels = load_pseudo_labels(PSEUDO_SOURCE)
-    n_with = sum(1 for v in pseudo_labels.values() if v.sum() > 0)
-    print(f"    {len(pseudo_labels)} windows, {n_with} with predicted anomalies (seed)")
-
-    final_preds: Dict[str, np.ndarray] = {}
-    t_total = time.time()
-
-    for round_i in range(N_ROUNDS):
-        t_round = time.time()
-        n_pseudo = sum(1 for v in pseudo_labels.values() if v.sum() > 0)
-        print(f"\n{'='*60}")
-        print(f"  ROUND {round_i + 1}/{N_ROUNDS}  —  pseudo-labeled windows: {n_pseudo}")
-        print(f"{'='*60}")
-
-        ensembles = fit_both_ensembles(
-            all_wdirs, top_services, train_gs, test_gs,
-            pseudo_labels, wid_map,
-        )
-
-        print(f"  Predicting all 1000 test windows…")
-        preds = predict_all_test_windows(ensembles, top_services, test_gs, all_wdirs)
-        final_preds = preds
-
-        n_new = sum(1 for v in preds.values() if v.sum() > 0)
-        n_changed = sum(
-            1 for wid, v in preds.items()
-            if wid in pseudo_labels and not np.array_equal(v, pseudo_labels[wid])
-        )
-        print(f"  Round {round_i + 1} done in {time.time() - t_round:.0f}s  "
-              f"|  windows-with-anomalies: {n_new}  |  changed: {n_changed}")
-
-        # Update pseudo-labels for next round
-        pseudo_labels = {wid: arr.astype(np.int64) for wid, arr in preds.items()}
-
-    print(f"\n>>> All {N_ROUNDS} rounds done in {time.time() - t_total:.0f}s total")
-    return final_preds
-
-
-# ─────────────────────────────────────────────
-# Write submission
-# ─────────────────────────────────────────────
-
-def write_submission(preds: Dict[str, np.ndarray],
-                     output: Path = Path("submission_v59_lgbm_multirounds.json")) -> Path:
-    out = {wid: arr.astype(int).tolist() for wid, arr in preds.items()}
-    assert len(out) == 1000
-    output.write_text(
-        json.dumps({"predictions": out}, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    print(f">>> Wrote {output}  ({len(out)} windows)")
+        preds[w.wid] = pred.astype(int).tolist()
+        if i % 100 == 0:
+            print(f"    {i}/1000 ({time.time()-t0:.0f}s)")
+    assert len(preds) == 1000
+    output.write_text(json.dumps({"predictions": preds}, ensure_ascii=False,
+                                  separators=(",", ":")), encoding="utf-8")
+    print(f">>> Wrote {output}")
     return output
 
 
 if __name__ == "__main__":
-    print(f"LightGBM {lgb.__version__}")
-    print(f"N_ROUNDS={N_ROUNDS}  PSEUDO_WEIGHT={PSEUDO_WEIGHT}  W_SHIFT={W_SHIFT}")
-    print(f"Seed: {PSEUDO_SOURCE}\n")
+    print(f"Pseudo-label source: {PSEUDO_SOURCE}")
+    print(f"N_FEATS_P1={N_FEATS_P1}  N_FEATS_P2={N_FEATS_P2}  FFT_K=adaptive(min(10,n//4))\n")
 
-    final_preds = run_multirounds()
-    write_submission(final_preds)
-    print("\nDone. Submit submission_v59_lgbm_multirounds.json")
+    pseudo_labels = load_pseudo_labels(PSEUDO_SOURCE)
+    n_with = sum(1 for v in pseudo_labels.values() if v.sum() > 0)
+    print(f"Loaded {len(pseudo_labels)} pseudo-label windows, {n_with} with anomalies")
+
+    wid_map = build_wid_map(all_window_dirs())
+
+    rep = run_validation(pseudo_labels, wid_map)
+
+    print("\n>>> Re-training on ALL windows for final submission…")
+    t0 = time.time()
+    top_sv = compute_top_services(all_window_dirs())
+    train_gs = compute_window_global_stats(all_window_dirs(), "train.npy")
+    test_gs  = compute_window_global_stats(all_window_dirs(), "test.npy")
+    ensembles = fit_both_ensembles(all_window_dirs(), top_sv, train_gs, test_gs,
+                                   pseudo_labels, wid_map)
+    print(f"    full fit {time.time()-t0:.1f}s")
+    generate_submission(ensembles, top_sv, test_gs)
+    print("\nDone. Submit submission_v60_fft_features.json")
