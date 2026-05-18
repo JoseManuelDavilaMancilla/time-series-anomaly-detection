@@ -1,11 +1,11 @@
 """
-author v46 — SPLIT_FRAC=0.60: same as v43 but larger pseudo-test portion (40% vs 30%).
+author v47 — SPLIT_FRAC=0.80: same as v43 but smaller pseudo-test portion (20% vs 30%).
 
-Hypothesis: giving P2 more pseudo-test training data (40% instead of 30%)
-improves shift detection. W_SHIFT=0.30 kept from v43.
+Hypothesis: giving P2 a more stable reference (80% instead of 70%) makes the
+shift features more reliable. W_SHIFT=0.30 kept from v43.
 v43 baseline: 0.6561 LB (SPLIT_FRAC=0.70).
 
-Run:  uv run python v46_split60.py
+Run:  uv run python v47_split80.py
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ TOP_K_SERVICES = 30
 SMOOTH_W = 5
 SMOOTH_ALPHA = 0.8
 W_SHIFT = 0.30          # blend weight for P2 shift model
-SPLIT_FRAC = 0.60       # fraction of train_x used as "reference" for P2 training
+SPLIT_FRAC = 0.80       # fraction of train_x used as "reference" for P2 training
 N_FEATS_P1 = 68
 N_FEATS_P2 = 75         # 68 + 7 shift features
 
@@ -485,10 +485,10 @@ def run_validation(seed: int = 42):
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v46 SPLIT_FRAC=0.60 (CW-LOO)")
+    print_summary_v2(rep, "v47 SPLIT_FRAC=0.80 (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v46_split60_loo")
+    save_report(rep, "v47_split80_loo")
     return rep, ensembles, top_services
 
 
@@ -527,4 +527,4 @@ if __name__ == "__main__":
     ensembles_full = fit_both_ensembles(all_window_dirs(), top_services_full)
     print(f"    full fit {time.time() - t0:.1f}s")
     generate_submission(ensembles_full, top_services_full,
-                        output=Path("submission_v46_split60.json"))
+                        output=Path("submission_v47_split80.json"))
