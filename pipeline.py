@@ -1,18 +1,16 @@
 """
-author v52 — v50 features (74) + v51 pseudo-labeling stacked.
+author v53 — iterated pseudo-labeling round 2.
 
-v50 LB: 0.6602 (new best, beat friend's 0.66) — extended rolling min/max at w=5,21,41.
-v51: pseudo-labeling with v43 predictions. Running simultaneously.
-v52: combines BOTH: 74-feature P1/81-feature P2 + pseudo-labeled test windows.
+v52 LB: TBD. Uses v52 predictions as pseudo-labels (one more EM step).
+Each iteration uses a stronger model's predictions → better pseudo-labels → better model.
 
-  P1: 74 features (68 base + 6 extra rolling min/max)
-  P2: 81 features (74 + 7 shift)
-  Pseudo-labels: from submission_v50_more_minmax.json (0.6602 LB — best available)
+  Round 0: v43 predictions (0.6561 LB) → v51 got 0.6711
+  Round 1: v51 predictions (0.6711 LB) → v52 (running)
+  Round 2: v52 predictions → v53 (this script)
 
-Sample weight: true labeled points = 1.0, pseudo-labeled points = PSEUDO_WEIGHT.
-Windows where pseudo_y.sum()==0 are skipped (no predicted anomalies).
+74 features + v52 pseudo-labels. PSEUDO_WEIGHT=0.30 unchanged.
 
-Run:  uv run python v51_pseudo_label.py
+Run:  uv run python v53_iter_pseudo.py
 """
 
 from __future__ import annotations
@@ -48,7 +46,7 @@ SPLIT_FRAC = 0.70
 N_FEATS_P1 = 74          # 68 base + 6 extra rolling min/max
 N_FEATS_P2 = 81          # 74 + 7 shift features
 PSEUDO_WEIGHT = 0.30    # sample weight for pseudo-labeled test windows
-PSEUDO_SOURCE = Path("submission_v51_pseudo_label.json")
+PSEUDO_SOURCE = Path("submission_v52_minmax_pseudo.json")
 
 
 # ─────────────────────────────────────────────
@@ -576,15 +574,15 @@ def run_validation(pseudo_labels, wid_map, seed: int = 42):
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v52 minmax+pseudo (CW-LOO)")
+    print_summary_v2(rep, "v53 iter-pseudo round2 (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v52_minmax_pseudo_loo")
+    save_report(rep, "v53_iter_pseudo_loo")
     return rep, ensembles, top_services
 
 
 def generate_submission(ensembles, top_services,
-                        output: Path = Path("submission_v52_minmax_pseudo.json")) -> Path:
+                        output: Path = Path("submission_v53_iter_pseudo.json")) -> Path:
     print(f"\n>>> Generating predictions on all 1000 test windows…")
     preds: Dict[str, list] = {}
     t0 = time.time()
