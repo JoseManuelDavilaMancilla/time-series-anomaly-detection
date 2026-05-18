@@ -1,32 +1,28 @@
 """
-author v18 — segment-level classifier (radical change).
+author v19 — 1D convolutional autoencoder reconstruction-error channel (radical).
 
-Hypothesis: every channel we have scores INDIVIDUAL POINTS. The truth is
-CONTIGUOUS SEGMENTS (mean length ~17, ~2 segments per window). We've been
-working around this with post-processing (smooth + grow). A segment-level
-classifier directly learns "what does an anomalous segment look like" by
-seeing whole segments as training examples, with segment-level features
-that aren't visible point-by-point: length, position, boundary discontinuity,
-context delta, channel-score statistics across the segment.
+v18's segment-level classifier showed that every existing channel measures
+essentially the same thing: "is this point unusual relative to a reference".
+The feature importances were dominated by CW score statistics. Adding shape
+features did not help because CW already captures shape implicitly.
 
-Pipeline:
-  1. Train the existing v14 score channels (CW, CNN, IF, online, global).
-  2. For each training window, score points with the channels, generate
-     ~60–150 candidate (start, end) segments at multiple thr_frac×smooth
-     combos, label them by IoU>=0.5 with true anomaly segments.
-  3. Extract ~25 features per candidate (geometry + value stats + context
-     deltas + channel score stats).
-  4. Train RandomForest segment classifier on pooled features.
-  5. At inference, generate candidates on test, classify each, greedily
-     pick non-overlapping highest-scoring segments until budget=k reached.
+A genuinely different signal type is **reconstruction error** under a model
+that learned only the NORMAL distribution. Train an autoencoder on training
+windows (with high weight on normal points, zero/low weight on anomalies);
+at inference, the points the AE cannot reconstruct are anomalous.
 
-Caveats:
-- CW score on training portion is biased (CW saw those labels). We accept
-  this for the first version; if it works we add OOF predictions in v18b.
-- Per-window RF is excluded from the channel set — its train-portion scores
-  are pathologically overfit.
+Implementation:
+  - 1D conv autoencoder: input is a 32-point z-scored context window.
+    Encoder: Conv(1→32, k=3) → Conv(32→64, k=5, stride=2) → Conv(64→64, k=7).
+    Decoder: mirror. Bottleneck of 16 channels × 16 timesteps.
+  - Trained on training-window contexts where train_y == 0 (normal points
+    only — this is what makes it an "unsupervised normality model").
+  - Anomaly score per point = squared reconstruction error at the centre.
+  - Added to v14's ensemble at a tunable weight (sweep 0.05/0.10/0.15).
 
-Run:  uv run python v18_segment_classifier.py
+Stacks on top of v14 (our current 0.6238 LB best).
+
+Run:  uv run python v19_autoencoder.py
 """
 
 from __future__ import annotations
@@ -35,14 +31,14 @@ import json
 import time
 import warnings
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-from sklearn.ensemble import RandomForestClassifier
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
-warnings.filterwarnings("ignore", category=UserWarning)
 
 from shared_lib import (
     CrossWindowModel,
@@ -55,348 +51,203 @@ from shared_lib import (
     per_window_rf_score,
     predict_segments,
 )
-from v6_cnn import build_training_pool as v6_pool, SPECIALIZED
+from v6_cnn import (
+    BATCH, DEVICE, LR, SEED, SPECIALIZED, SUBSAMPLE_NEG,
+    _zscore_series,
+    build_training_pool as v6_pool,
+)
 from v7_cnn_ensemble import CNN_SEEDS, ensemble_cnn_score, fit_cnn_with_seed
 from validation import (
     all_window_dirs,
+    evaluate,
     load_window,
-    point_f1,
+    print_summary,
     save_report,
     stratified_holdout,
 )
 
-# Candidate generation knobs
-THR_FRACS = (0.4, 0.5, 0.6, 0.7, 0.8)
-SMOOTHS = (3, 5)
-PEAK_QUANTILE = 0.7
-MIN_SEG_LEN = 2
-MAX_SEG_LEN = 80
-
-# Labeling
-IOU_POSITIVE = 0.5
-
-# v14 fixed channel weights (used both to build per-point ensemble score
-# and as features into the segment classifier)
+CONTEXT = 32
+AE_EPOCHS = 6
+AE_LR = 1e-3
+SEG_KWARGS = dict(smooth=3, thr_frac=0.7, small_k_cutoff=4, max_seg=60)
 CNN_WEIGHT = 0.35
 
 
 # ─────────────────────────────────────────────
-# Candidate generation
+# Autoencoder model
 # ─────────────────────────────────────────────
 
 
-def _find_peaks(s: np.ndarray, min_height: float) -> np.ndarray:
-    """Local maxima ≥ min_height. Simple comparison, no scipy."""
+class ConvAE(nn.Module):
+    """Small 1D conv autoencoder for 32-pt context. ~30k params."""
+
+    def __init__(self, context: int = CONTEXT):
+        super().__init__()
+        self.context = context
+        # Encoder
+        self.e1 = nn.Conv1d(1, 32, kernel_size=3, padding=1)            # 32, 32
+        self.e2 = nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2)  # 64, 16
+        self.e3 = nn.Conv1d(64, 64, kernel_size=7, padding=3)            # 64, 16
+        self.bn1, self.bn2, self.bn3 = nn.BatchNorm1d(32), nn.BatchNorm1d(64), nn.BatchNorm1d(64)
+        # Decoder
+        self.d1 = nn.Conv1d(64, 64, kernel_size=7, padding=3)
+        self.d2 = nn.ConvTranspose1d(64, 32, kernel_size=5, stride=2, padding=2, output_padding=1)
+        self.d3 = nn.Conv1d(32, 1, kernel_size=3, padding=1)
+        self.bn4, self.bn5 = nn.BatchNorm1d(64), nn.BatchNorm1d(32)
+
+    def forward(self, x):
+        # x: (B, context)
+        x = x.unsqueeze(1)  # (B, 1, context)
+        h = F.relu(self.bn1(self.e1(x)))
+        h = F.relu(self.bn2(self.e2(h)))
+        h = F.relu(self.bn3(self.e3(h)))
+        h = F.relu(self.bn4(self.d1(h)))
+        h = F.relu(self.bn5(self.d2(h)))
+        out = self.d3(h)
+        return out.squeeze(1)  # (B, context)
+
+
+# ─────────────────────────────────────────────
+# Data: build NORMAL-only contexts pool
+# ─────────────────────────────────────────────
+
+
+def build_contexts(series: np.ndarray, context: int = CONTEXT) -> np.ndarray:
+    s = _zscore_series(series)
+    half = context // 2
+    padded = np.pad(s, (half, half), mode="constant", constant_values=0.0)
     n = len(s)
-    if n < 3:
-        return np.array([], dtype=int)
-    higher_than_prev = s[1:-1] > s[:-2]
-    higher_than_next = s[1:-1] >= s[2:]
-    above = s[1:-1] >= min_height
-    return np.where(higher_than_prev & higher_than_next & above)[0] + 1
+    out = np.empty((n, context), dtype=np.float32)
+    for i in range(n):
+        out[i] = padded[i : i + context]
+    return out
 
 
-def generate_candidates(scores: np.ndarray) -> List[Tuple[int, int]]:
-    """From a per-point score array, return unique (start, end) candidate segments."""
-    candidates: set[Tuple[int, int]] = set()
-    n = len(scores)
-    for smooth in SMOOTHS:
-        s = np.convolve(scores, np.ones(smooth) / smooth, mode="same") if smooth > 1 else scores
-        threshold = float(np.quantile(s, PEAK_QUANTILE))
-        peaks = _find_peaks(s, threshold)
-        for peak in peaks:
-            peak_v = s[peak]
-            for tf in THR_FRACS:
-                thr = tf * peak_v
-                L, R = int(peak), int(peak)
-                while L > 0 and s[L - 1] >= thr:
-                    L -= 1
-                while R < n - 1 and s[R + 1] >= thr:
-                    R += 1
-                seg_len = R - L + 1
-                if MIN_SEG_LEN <= seg_len <= MAX_SEG_LEN:
-                    candidates.add((L, R))
-    return sorted(candidates)
-
-
-# ─────────────────────────────────────────────
-# Feature extraction
-# ─────────────────────────────────────────────
-
-
-CHANNEL_KEYS = ("cw", "cnn", "if", "g", "local")
-
-FEATURE_NAMES = [
-    "length", "length_ratio", "rel_pos_center",
-    "val_mean", "val_std", "val_min", "val_max", "val_range",
-    "val_z_train", "val_slope_normalized",
-    "before_mean", "before_std", "boundary_jump_left",
-    "after_mean", "after_std", "boundary_jump_right",
-    # Channel score stats
-] + [f"{c}_mean" for c in CHANNEL_KEYS] + [f"{c}_max" for c in CHANNEL_KEYS] + [
-    "ensemble_mean", "ensemble_max",
-]
-
-
-def _safe_div(num, den):
-    return num / (den + 1e-9)
-
-
-def segment_features(
-    seg: Tuple[int, int], series: np.ndarray, channels: Dict[str, np.ndarray],
-    train_mean: float, train_std: float,
-) -> np.ndarray:
-    start, end = seg
-    n = len(series)
-    seg_x = series[start : end + 1].astype(np.float64)
-    seg_len = end - start + 1
-
-    # Geometry
-    f = [
-        seg_len,
-        seg_len / 16.85,
-        (start + end) / (2.0 * n),
-    ]
-    # Value stats
-    f += [
-        float(seg_x.mean()),
-        float(seg_x.std()),
-        float(seg_x.min()),
-        float(seg_x.max()),
-        float(seg_x.max() - seg_x.min()),
-        _safe_div(seg_x.mean() - train_mean, train_std),
-        _safe_div(seg_x[-1] - seg_x[0], seg_len),
-    ]
-    # Context
-    before = series[max(0, start - 16) : start].astype(np.float64)
-    after = series[end + 1 : min(n, end + 17)].astype(np.float64)
-    f += [
-        float(before.mean()) if len(before) else 0.0,
-        float(before.std()) if len(before) > 1 else 0.0,
-        float(abs(seg_x[0] - before.mean())) if len(before) else 0.0,
-        float(after.mean()) if len(after) else 0.0,
-        float(after.std()) if len(after) > 1 else 0.0,
-        float(abs(seg_x[-1] - after.mean())) if len(after) else 0.0,
-    ]
-    # Channel-score stats
-    for ck in CHANNEL_KEYS:
-        chs = channels[ck][start : end + 1]
-        f.append(float(chs.mean()))
-    for ck in CHANNEL_KEYS:
-        chs = channels[ck][start : end + 1]
-        f.append(float(chs.max()))
-    # Ensemble stats (using v14-style weights would require knowing category;
-    # use simple normalized average across channels as a stable summary)
-    ens = np.mean([channels[ck] for ck in CHANNEL_KEYS], axis=0)
-    es = ens[start : end + 1]
-    f += [float(es.mean()), float(es.max())]
-
-    return np.array(f, dtype=np.float32)
-
-
-# ─────────────────────────────────────────────
-# IoU labeling
-# ─────────────────────────────────────────────
-
-
-def true_segments_from_mask(mask: np.ndarray) -> List[Tuple[int, int]]:
-    if mask.sum() == 0:
-        return []
-    diffs = np.diff(np.concatenate([[0], mask.astype(int), [0]]))
-    starts = np.where(diffs == 1)[0]
-    ends = np.where(diffs == -1)[0] - 1
-    return list(zip(starts.tolist(), ends.tolist()))
-
-
-def label_by_iou(candidates: List[Tuple[int, int]],
-                 mask: np.ndarray, threshold: float = IOU_POSITIVE) -> np.ndarray:
-    truth = true_segments_from_mask(mask)
-    if not truth:
-        return np.zeros(len(candidates), dtype=np.int32)
-    labels = np.zeros(len(candidates), dtype=np.int32)
-    for i, (cs, ce) in enumerate(candidates):
-        best_iou = 0.0
-        for (ts, te) in truth:
-            i_start = max(cs, ts)
-            i_end = min(ce, te)
-            if i_end < i_start:
-                continue
-            inter = i_end - i_start + 1
-            union = (ce - cs + 1) + (te - ts + 1) - inter
-            iou = inter / union
-            if iou > best_iou:
-                best_iou = iou
-        if best_iou >= threshold:
-            labels[i] = 1
-    return labels
-
-
-# ─────────────────────────────────────────────
-# Channel score computation (no per-window RF, no v14 ensemble)
-# ─────────────────────────────────────────────
-
-
-def compute_channels(train_x, train_y, test_x, cw, cnn_models, metric_type
-                     ) -> Dict[str, np.ndarray]:
-    n = len(test_x)
-    return {
-        "cw":   normalize_scores(cw.predict_proba(test_x, metric_type=metric_type)),
-        "cnn":  normalize_scores(ensemble_cnn_score(cnn_models, test_x)),
-        "if":   normalize_scores(isolation_forest_test(test_x, train_y)),
-        "g":    normalize_scores(global_distance_score(train_x, test_x)),
-        "local": normalize_scores(online_ensemble(test_x, window=15)),
-    }
-
-
-def ensemble_score(channels: Dict[str, np.ndarray], category: str) -> np.ndarray:
-    """v14-style blend, used to drive candidate generation."""
-    cw, cnn, if_, g, local = (channels[k] for k in CHANNEL_KEYS)
-    if category == "constant_train":
-        return (0.50 - CNN_WEIGHT) * cw + 0.50 * if_ + CNN_WEIGHT * cnn
-    if category == "disjoint":
-        return 0.35 * cw + 0.30 * g + (0.35 - CNN_WEIGHT) * if_ + CNN_WEIGHT * cnn
-    if category == "partial_overlap":
-        return 0.35 * cw + (0.30 - CNN_WEIGHT) * local + CNN_WEIGHT * cnn + 0.35 * if_  # use if_ in place of pw
-    if category == "test_within_train":
-        return (0.50 - CNN_WEIGHT) * cw + 0.50 * if_ + CNN_WEIGHT * cnn  # if_ in place of pw
-    return np.zeros(len(cw))
-
-
-# ─────────────────────────────────────────────
-# Training data construction
-# ─────────────────────────────────────────────
-
-
-def build_segment_training_data(
-    window_dirs, cw, cnn_models,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """For each window with anomalies, generate candidates from train portion,
-    label via IoU, extract features. Pool. Returns X, y, window_idx."""
-    Xs, ys, idxs = [], [], []
-    n_pos_total = 0
-    n_neg_total = 0
-    for wi, wdir in enumerate(window_dirs):
+def build_normal_pool(window_dirs) -> np.ndarray:
+    """Per-point contexts where train_label == 0 only. AE learns to reconstruct normal points."""
+    Xs = []
+    for wdir in window_dirs:
         train_y = np.load(wdir / "train_label.npy")
-        if train_y.sum() == 0:
-            continue
         train_x = np.load(wdir / "train.npy")
-        if len(train_x) < 20:
+        if len(train_x) < CONTEXT // 2 + 4:
             continue
-        info = json.loads((wdir / "info.json").read_text())
-        metric_type = info.get("metric_type", "Unknown")
-
-        chans = compute_channels(train_x, train_y, train_x, cw, cnn_models, metric_type)
-        category = categorize_window(train_x, train_x)
-        scores = ensemble_score(chans, category)
-
-        candidates = generate_candidates(scores)
-        if not candidates:
-            continue
-
-        labels = label_by_iou(candidates, train_y)
-        train_mean = float(np.mean(train_x))
-        train_std = float(np.std(train_x))
-
-        for cand, lab in zip(candidates, labels):
-            feat = segment_features(cand, train_x, chans, train_mean, train_std)
-            Xs.append(feat); ys.append(int(lab)); idxs.append(wi)
-            if lab == 1:
-                n_pos_total += 1
-            else:
-                n_neg_total += 1
-
+        ctxs = build_contexts(train_x)
+        mask = train_y == 0
+        Xs.append(ctxs[mask])
     X = np.vstack(Xs)
-    y = np.array(ys, dtype=np.int32)
-    idx = np.array(idxs, dtype=np.int32)
-    print(f"  segment training data: X={X.shape}  pos={n_pos_total}  neg={n_neg_total}  pos_rate={y.mean():.3f}")
-    return X, y, idx
+    # Subsample to keep training quick (~80k samples)
+    if len(X) > 80000:
+        rng = np.random.default_rng(SEED)
+        idx = rng.choice(len(X), 80000, replace=False)
+        X = X[idx]
+    return X
 
 
-def fit_segment_classifier(X: np.ndarray, y: np.ndarray) -> RandomForestClassifier:
-    clf = RandomForestClassifier(
-        n_estimators=500,
-        max_depth=12,
-        min_samples_leaf=5,
-        class_weight="balanced",
-        random_state=42,
-        n_jobs=4,
-    )
-    clf.fit(X, y)
-    importances = sorted(zip(FEATURE_NAMES, clf.feature_importances_), key=lambda x: -x[1])
-    print("  top 10 features:")
-    for n, i in importances[:10]:
-        print(f"    {n:<25}  {i:.3f}")
-    return clf
+def fit_autoencoder(X: np.ndarray, seed: int = 42) -> ConvAE:
+    import sys
+    torch.manual_seed(seed); np.random.seed(seed)
+    model = ConvAE().to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=AE_LR)
+    loss_fn = nn.MSELoss()
+
+    ds = TensorDataset(torch.from_numpy(X))
+    dl = DataLoader(ds, batch_size=BATCH, shuffle=True, num_workers=0)
+
+    for epoch in range(AE_EPOCHS):
+        model.train()
+        running, n_batches = 0.0, 0
+        t0 = time.time()
+        for (xb,) in dl:
+            xb = xb.to(DEVICE)
+            opt.zero_grad()
+            recon = model(xb)
+            loss = loss_fn(recon, xb)
+            loss.backward(); opt.step()
+            running += loss.item(); n_batches += 1
+        print(f"      AE epoch {epoch + 1}/{AE_EPOCHS}  loss={running / n_batches:.4f}  "
+              f"({time.time() - t0:.1f}s)", flush=True)
+        sys.stdout.flush()
+    return model
 
 
 # ─────────────────────────────────────────────
-# Inference: candidate scoring + greedy non-overlapping selection
+# Reconstruction-error scoring
 # ─────────────────────────────────────────────
 
 
-def greedy_pick(candidates: List[Tuple[int, int]], scores: np.ndarray,
-                budget: int, n: int) -> np.ndarray:
-    pred = np.zeros(n, dtype=int)
-    if budget <= 0:
-        return pred
-    order = np.argsort(-scores)
-    used_total = 0
-    used_intervals: List[Tuple[int, int]] = []
-    for i in order:
-        cs, ce = candidates[i]
-        # check overlap with existing intervals
-        overlap = False
-        for (us, ue) in used_intervals:
-            if not (ce < us or cs > ue):
-                overlap = True
-                break
-        if overlap:
-            continue
-        # Truncate to remaining budget
-        seg_len = ce - cs + 1
-        if used_total + seg_len > budget:
-            ce = cs + (budget - used_total) - 1
-            seg_len = ce - cs + 1
-            if seg_len <= 0:
-                continue
-        pred[cs : ce + 1] = 1
-        used_intervals.append((cs, ce))
-        used_total += seg_len
-        if used_total >= budget:
-            break
-    return pred
+def ae_score(model: ConvAE, test_x: np.ndarray) -> np.ndarray:
+    """Per-point reconstruction error at the centre of each context window."""
+    model.eval()
+    X = build_contexts(test_x)
+    with torch.no_grad():
+        xb = torch.from_numpy(X).to(DEVICE)
+        recon = model(xb).cpu().numpy()
+    # Squared error at centre position
+    centre = CONTEXT // 2
+    return (recon[:, centre] - X[:, centre]) ** 2
 
 
-def predict_one_window(
-    train_x, train_y, test_x, cw, cnn_models, metric_type, seg_classifier,
-    test_ratio: float, fallback_to_heuristic: bool = True,
-) -> np.ndarray:
-    chans = compute_channels(train_x, train_y, test_x, cw, cnn_models, metric_type)
+# ─────────────────────────────────────────────
+# Ensemble integration
+# ─────────────────────────────────────────────
+
+
+def scores_with_ae(train_x, train_y, test_x, cw, cnn_models, ae_model,
+                   metric_type, ae_weight: float = 0.10) -> np.ndarray:
+    """v14 ensemble + autoencoder channel at low weight, trimming CW share."""
     category = categorize_window(train_x, test_x)
-    scores = ensemble_score(chans, category)
-    candidates = generate_candidates(scores)
+    cw_s   = normalize_scores(cw.predict_proba(test_x, metric_type=metric_type))
+    cnn_s  = normalize_scores(ensemble_cnn_score(cnn_models, test_x))
+    ae_s   = normalize_scores(ae_score(ae_model, test_x))
 
-    n = len(test_x)
-    k = int(round(n * test_ratio))
+    if category == "constant_train":
+        if_s = normalize_scores(isolation_forest_test(test_x, train_y))
+        return ((0.50 - ae_weight) * cw_s + 0.50 * if_s
+                + CNN_WEIGHT * cnn_s + ae_weight * ae_s
+                - CNN_WEIGHT * cw_s)  # cancel CNN's slice off cw, keep formula consistent
+    if category == "disjoint":
+        g_s = normalize_scores(global_distance_score(train_x, test_x))
+        if_s = normalize_scores(isolation_forest_test(test_x, train_y))
+        return (0.35 * cw_s + 0.30 * g_s + (0.35 - CNN_WEIGHT - ae_weight) * if_s
+                + CNN_WEIGHT * cnn_s + ae_weight * ae_s)
+    if category == "partial_overlap":
+        pw    = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
+        local = normalize_scores(online_ensemble(test_x, window=15))
+        return (0.35 * cw_s + 0.35 * pw + (0.30 - CNN_WEIGHT - ae_weight) * local
+                + CNN_WEIGHT * cnn_s + ae_weight * ae_s)
+    if category == "test_within_train":
+        pw = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
+        return ((0.50 - CNN_WEIGHT - ae_weight) * cw_s + 0.50 * pw
+                + CNN_WEIGHT * cnn_s + ae_weight * ae_s)
+    return np.zeros(len(test_x))
 
-    if not candidates:
-        if fallback_to_heuristic:
-            return predict_segments(scores, k,
-                                    smooth=3, thr_frac=0.7, small_k_cutoff=4, max_seg=60)
-        return np.zeros(n, dtype=int)
 
-    train_mean = float(np.mean(train_x))
-    train_std = float(np.std(train_x))
-    X = np.vstack([segment_features(c, test_x, chans, train_mean, train_std)
-                   for c in candidates])
-    proba = seg_classifier.predict_proba(X)
-    cand_scores = proba[:, 1] if proba.shape[1] > 1 else np.zeros(len(candidates))
-    return greedy_pick(candidates, cand_scores, k, n)
+def scores_v14(train_x, train_y, test_x, cw, cnn_models, metric_type) -> np.ndarray:
+    """Baseline v14 with no AE channel."""
+    return scores_with_ae(train_x, train_y, test_x, cw, cnn_models,
+                          ae_model=None, metric_type=metric_type, ae_weight=0.0) \
+        if False else _scores_v14_noae(train_x, train_y, test_x, cw, cnn_models, metric_type)
 
 
-# ─────────────────────────────────────────────
-# Build CW + CNN (shared with v14)
-# ─────────────────────────────────────────────
+def _scores_v14_noae(train_x, train_y, test_x, cw, cnn_models, metric_type) -> np.ndarray:
+    category = categorize_window(train_x, test_x)
+    cw_s   = normalize_scores(cw.predict_proba(test_x, metric_type=metric_type))
+    cnn_s  = normalize_scores(ensemble_cnn_score(cnn_models, test_x))
+    if category == "constant_train":
+        if_s = normalize_scores(isolation_forest_test(test_x, train_y))
+        return (0.50 - CNN_WEIGHT) * cw_s + 0.50 * if_s + CNN_WEIGHT * cnn_s
+    if category == "disjoint":
+        g_s = normalize_scores(global_distance_score(train_x, test_x))
+        if_s = normalize_scores(isolation_forest_test(test_x, train_y))
+        return 0.35 * cw_s + 0.30 * g_s + (0.35 - CNN_WEIGHT) * if_s + CNN_WEIGHT * cnn_s
+    if category == "partial_overlap":
+        pw    = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
+        local = normalize_scores(online_ensemble(test_x, window=15))
+        return 0.35 * cw_s + 0.35 * pw + (0.30 - CNN_WEIGHT) * local + CNN_WEIGHT * cnn_s
+    if category == "test_within_train":
+        pw = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
+        return (0.50 - CNN_WEIGHT) * cw_s + 0.50 * pw + CNN_WEIGHT * cnn_s
+    return np.zeros(len(test_x))
 
 
 def build_rf_hybrid(window_dirs):
@@ -408,14 +259,7 @@ def build_rf_hybrid(window_dirs):
                                   specialized_types=SPECIALIZED)
 
 
-# ─────────────────────────────────────────────
-# Validation
-# ─────────────────────────────────────────────
-
-
 def run_validation(seed: int = 42) -> dict:
-    from validation import time_split
-
     print("\n>>> Building stratified holdout (10%)…")
     train_pool, holdout = stratified_holdout(all_window_dirs(), frac=0.10, seed=seed)
     print(f"    train_pool={len(train_pool)}  holdout={len(holdout)}")
@@ -433,73 +277,75 @@ def run_validation(seed: int = 42) -> dict:
         cnn_models.append(fit_cnn_with_seed(Xc, yc, s))
         print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
 
-    print("\n>>> Building segment training data from train_pool…")
+    print(">>> Building NORMAL-only pool for AE…")
+    Xae = build_normal_pool(train_pool)
+    print(f"    AE pool X={Xae.shape}")
+    print(">>> Training autoencoder…")
     t0 = time.time()
-    Xseg, yseg, _ = build_segment_training_data(train_pool, cw, cnn_models)
-    print(f"    built in {time.time() - t0:.1f}s")
-
-    print(">>> Training segment classifier (RF)…")
-    t0 = time.time()
-    seg_clf = fit_segment_classifier(Xseg, yseg)
+    ae_model = fit_autoencoder(Xae, seed=42)
     print(f"    fit {time.time() - t0:.1f}s")
 
-    print("\n>>> Evaluating on 100-window holdout (70/30 time split)…")
-    f1_v18, f1_baseline = [], []
-    for wdir in holdout:
-        w = load_window(wdir)
-        sub_tr_x, sub_tr_y, sub_te_x, sub_te_y = time_split(w.train_x, w.train_y, frac=0.70)
-        ratio = float(sub_te_y.mean()) if len(sub_te_y) else 0.0
+    def predictor_factory(ae_w):
+        def pred(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
+            if ae_w == 0:
+                scores = _scores_v14_noae(sub_tr_x, sub_tr_y, sub_te_x, cw, cnn_models,
+                                          info.get("metric_type", "ALL"))
+            else:
+                scores = scores_with_ae(sub_tr_x, sub_tr_y, sub_te_x, cw, cnn_models,
+                                        ae_model, info.get("metric_type", "ALL"),
+                                        ae_weight=ae_w)
+            return predict_segments(scores, int(round(len(sub_te_x) * ratio)), **SEG_KWARGS)
+        return pred
 
-        # v18 prediction
-        pred18 = predict_one_window(sub_tr_x, sub_tr_y, sub_te_x, cw, cnn_models,
-                                    w.metric_type, seg_clf, ratio)
-        f1_v18.append(point_f1(sub_te_y, pred18))
+    print("\n>>> Eval: v14 baseline (no AE)…")
+    rep_base = evaluate(predictor_factory(0.0), holdout)
+    print_summary(rep_base, name="v14 baseline")
 
-        # v14 baseline prediction (heuristic post-processing)
-        chans = compute_channels(sub_tr_x, sub_tr_y, sub_te_x, cw, cnn_models, w.metric_type)
-        category = categorize_window(sub_tr_x, sub_te_x)
-        score = ensemble_score(chans, category)
-        k = int(round(len(sub_te_x) * ratio))
-        pred_base = predict_segments(score, k, smooth=3, thr_frac=0.7,
-                                     small_k_cutoff=4, max_seg=60)
-        f1_baseline.append(point_f1(sub_te_y, pred_base))
+    results = {"baseline": rep_base["overall_f1"]}
+    for w in (0.05, 0.10, 0.15, 0.20):
+        print(f"\n>>> Eval: v19 with AE_WEIGHT={w:.2f}…")
+        rep = evaluate(predictor_factory(w), holdout)
+        print_summary(rep, name=f"v19 ae_w={w:.2f}")
+        results[f"ae_w_{w:.2f}"] = rep["overall_f1"]
 
-    v18_f1 = float(np.mean(f1_v18))
-    base_f1 = float(np.mean(f1_baseline))
-    delta = v18_f1 - base_f1
-    print(f"\n  v14 baseline (heuristic post-proc) F1 = {base_f1:.4f}")
-    print(f"  v18 segment classifier             F1 = {v18_f1:.4f}")
-    print(f"  Δ (v18 − v14) = {delta:+.4f}")
+    print("\n──────  summary ──────")
+    base = results["baseline"]
+    rows = sorted([(k, v) for k, v in results.items() if k != "baseline"], key=lambda kv: -kv[1])
+    print(f"  baseline   F1={base:.4f}")
+    for name, f1 in rows:
+        print(f"  {name}  F1={f1:.4f}  Δ_vs_baseline={f1 - base:+.4f}")
 
+    winner_name, winner_f1 = rows[0]
     report = {
-        "baseline_f1": base_f1,
-        "v18_f1": v18_f1,
-        "delta": delta,
+        "results": results,
+        "winner": winner_name,
+        "delta_vs_baseline": winner_f1 - base,
         "seed": seed,
         "n_holdout": len(holdout),
     }
-    save_report(report, "v18_segment_classifier")
-    return report, cw, cnn_models, seg_clf, Xseg, yseg
+    save_report(report, "v19_autoencoder")
+    return report, cw, cnn_models, ae_model
 
 
-def generate_submission(output: Path = Path("submission_segment_classifier.json")) -> Path:
-    print("\n>>> Training RF hybrid on ALL 1000 windows…")
+def generate_submission(ae_weight: float, cw, cnn_models, ae_model,
+                        output: Path = Path("submission_autoencoder.json")) -> Path:
+    print(f"\n>>> Re-training all models on ALL 1000 windows (ae_weight={ae_weight:.2f})…")
     t0 = time.time()
-    cw = build_rf_hybrid(all_window_dirs())
-    print(f"    fit {time.time() - t0:.1f}s")
+    cw_full = build_rf_hybrid(all_window_dirs())
+    print(f"    rf fit {time.time() - t0:.1f}s")
 
-    print(">>> Training 3-seed CNN ensemble on full data…")
     Xc, yc = v6_pool(all_window_dirs())
-    cnn_models = []
+    cnn_full = []
     for s in CNN_SEEDS:
         t0 = time.time()
-        cnn_models.append(fit_cnn_with_seed(Xc, yc, s))
+        cnn_full.append(fit_cnn_with_seed(Xc, yc, s))
         print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
 
-    print(">>> Building segment training data from ALL 1000 windows…")
-    Xseg, yseg, _ = build_segment_training_data(all_window_dirs(), cw, cnn_models)
-    print(">>> Training segment classifier (RF)…")
-    seg_clf = fit_segment_classifier(Xseg, yseg)
+    Xae = build_normal_pool(all_window_dirs())
+    print(f"    AE pool X={Xae.shape}")
+    t0 = time.time()
+    ae_full = fit_autoencoder(Xae, seed=42)
+    print(f"    ae fit {time.time() - t0:.1f}s")
 
     print(">>> Generating predictions…")
     preds: dict[str, list[int]] = {}
@@ -507,9 +353,10 @@ def generate_submission(output: Path = Path("submission_segment_classifier.json"
     for i, wdir in enumerate(all_window_dirs(), 1):
         w = load_window(wdir)
         ratio = float(w.info.get("test set anomaly ratio", 0.0))
-        pred = predict_one_window(w.train_x, w.train_y, w.test_x, cw, cnn_models,
-                                  w.metric_type, seg_clf, ratio)
-        preds[w.wid] = pred.astype(int).tolist()
+        scores = scores_with_ae(w.train_x, w.train_y, w.test_x, cw_full, cnn_full,
+                                ae_full, w.metric_type, ae_weight=ae_weight)
+        k = int(round(len(w.test_x) * ratio))
+        preds[w.wid] = predict_segments(scores, k, **SEG_KWARGS).astype(int).tolist()
         if i % 100 == 0:
             print(f"    {i}/1000 ({time.time() - t0:.0f}s)")
 
@@ -523,10 +370,12 @@ def generate_submission(output: Path = Path("submission_segment_classifier.json"
 
 
 if __name__ == "__main__":
-    rep, *_ = run_validation()
-    if rep["delta"] > 0.003:
-        print(f"\nv18 beats v14 baseline by {rep['delta']:+.4f}; generating submission.")
-        generate_submission()
+    rep, cw, cnn_models, ae_model = run_validation()
+    if rep["delta_vs_baseline"] > 0.003:
+        ae_w = float(rep["winner"].replace("ae_w_", ""))
+        print(f"\nAE channel at weight {ae_w} beats baseline by {rep['delta_vs_baseline']:+.4f}; "
+              "generating submission.")
+        generate_submission(ae_w, cw, cnn_models, ae_model)
     else:
-        print(f"\nv18 did not meaningfully beat v14 baseline "
-              f"(Δ = {rep['delta']:+.4f}); submission NOT generated.")
+        print(f"\nAE channel did not meaningfully help "
+              f"(best Δ = {rep['delta_vs_baseline']:+.4f}); submission NOT generated.")
