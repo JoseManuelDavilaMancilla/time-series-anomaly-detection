@@ -49,7 +49,7 @@
 **When to activate:** After ARCHITECT hands off a plan.
 
 **Mandate:**
-- Implement the plan in a new `pipeline_v{NN}.py` (or patch `pipeline.py` if explicitly asked).
+- Implement the plan by **modifying `pipeline.py` directly**. Do not create new `pipeline_v{NN}.py` files.
 - Preserve all working features from the base version. **Do not refactor unrelated code.**
 - Add the new feature behind a flag when possible (e.g., `USE_CATCH22 = True`).
 - Ensure deterministic output: set all random seeds, use `np.lexsort` for tie-breaking.
@@ -57,7 +57,7 @@
 **Rules:**
 - Import order: `numpy`, `sklearn`, external libs, then local modules (`validation`, `cross_validation`).
 - Every new feature function must have a docstring explaining shape, dtype, and semantics.
-- Never commit `pipeline.py` directly to git — GUARDIAN handles commits.
+- After modifying `pipeline.py`, notify GUARDIAN to commit.
 - If pseudo-labels are needed and the source JSON is missing, fall back to `PSEUDO_WEIGHT = 0` for the first run, then iterate.
 
 **Handoff to TESTER:**
@@ -160,6 +160,7 @@ ARCHITECT ← updated HANDOFF.md (loop)
 - TESTER modifies code to "fix" bugs — report to BUILDER instead.
 - BLENDER changes feature code — only weights and post-processing.
 - Any agent deletes `submission_v{XX}.json` or overwrites a prior version's script.
+- **Creating `pipeline_v{NN}.py` files** — always modify `pipeline.py` directly.
 
 ---
 

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+catboost_info/
+*.log
+student_dataset
+tda_cache
+submission_*.json

@@ -1,5 +1,5 @@
 """
-author v71_segments — v71 with contiguous segment selection instead of top-k.
+author v71 — catch22 (22) + complexity (3) + per-metric rules (6) + CatBoost.
 
 Four new additions on top of v68 (108/115 features):
 
@@ -101,7 +101,7 @@ N_FEATS_P1      = 77 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_F
 N_FEATS_P2      = 84 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_FFT_BROAD + N_STL_AR_FEATS + N_CATCH22_FEATS + N_COMPLEX_FEATS + N_PMRULE_FEATS  # 146
 PSEUDO_WEIGHT   = 0.70
 PSEUDO_SOURCE   = Path("submission_v68_stl_ar.json")
-CACHE_DIR       = Path("../tda_cache")
+CACHE_DIR       = Path("tda_cache")
 MP_WINDOWS      = [5, 10, 20]
 EXTRA_ROLL_W    = [3, 7, 63]
 
@@ -789,83 +789,6 @@ def smooth_centered(p,w=SMOOTH_W):
     elif len(out)<len(p): out=np.convolve(p,kernel,mode="same")
     return out
 
-def predict_segments(score, k, smooth_w=3, thr_frac=0.7):
-    """Grow contiguous segments from peaks; fallback to top-k for small k."""
-    n = len(score)
-    k = max(0, min(k, n))
-    if k == 0:
-        return np.zeros(n, dtype=int)
-
-    # Small k fallback: exact top-k on raw score
-    if k <= 4:
-        order = np.argsort(-score)
-        pred = np.zeros(n, dtype=int)
-        pred[order[:k]] = 1
-        return pred
-
-    # Smooth with centered rolling mean
-    smoothed = smooth_centered(score, smooth_w)
-
-    # Threshold: peaks above thr_frac * max_score
-    thr = thr_frac * float(np.max(smoothed))
-    above = smoothed > thr
-
-    # Fallback to top-k if nothing crosses threshold
-    if not above.any():
-        order = np.argsort(-smoothed)
-        pred = np.zeros(n, dtype=int)
-        pred[order[:k]] = 1
-        return pred
-
-    # Find contiguous segments (connected components of above-threshold mask)
-    segments = []
-    in_seg = False
-    start = 0
-    for i in range(n):
-        if above[i]:
-            if not in_seg:
-                start = i
-                in_seg = True
-        else:
-            if in_seg:
-                segments.append((start, i))
-                in_seg = False
-    if in_seg:
-        segments.append((start, n))
-
-    # Score each segment by its peak smoothed value
-    seg_scores = []
-    for s, e in segments:
-        seg_scores.append((float(np.max(smoothed[s:e])), s, e))
-    seg_scores.sort(reverse=True)
-
-    # Greedily select segments until we reach exactly k anomalies
-    selected = np.zeros(n, dtype=bool)
-    count = 0
-    for _, s, e in seg_scores:
-        seg_len = e - s
-        if count + seg_len > k:
-            # Partial segment: take highest-scoring points within it
-            remaining = k - count
-            seg_order = np.argsort(-smoothed[s:e])[:remaining]
-            selected[s + seg_order] = True
-            count += remaining
-            break
-        selected[s:e] = True
-        count += seg_len
-        if count >= k:
-            break
-
-    # Safety: if still short, fill with highest remaining points globally
-    if count < k:
-        remaining = k - count
-        unselected = np.where(~selected)[0]
-        top_remaining = unselected[np.argsort(-smoothed[unselected])[:remaining]]
-        selected[top_remaining] = True
-
-    return selected.astype(int)
-
-
 def predict_window(test_x,test_ts,train_x_ref,info,service,top_services,
                    ensembles,win_global=(0.,0.,0.),wid_str=""):
     n=len(test_x)
@@ -875,7 +798,9 @@ def predict_window(test_x,test_ts,train_x_ref,info,service,top_services,
                               top_services,ensembles,win_global,wid_str)
     rm=smooth_centered(prob,SMOOTH_W)
     prob_f=(1.-SMOOTH_ALPHA)*prob+SMOOTH_ALPHA*rm
-    return predict_segments(prob_f, k)
+    order=np.lexsort((np.arange(n),-prob_f))
+    pred=np.zeros(n,dtype=int); pred[order[:k]]=1
+    return pred
 
 
 # ─────────────────────────────────────────────
@@ -923,6 +848,8 @@ def generate_submission(ensembles,top_services,test_gs,
 
 
 if __name__ == "__main__":
+    import os
+    os.chdir("..")
     print(f"Pseudo-label source: {PSEUDO_SOURCE}")
     print(f"N_FEATS_P1={N_FEATS_P1}  N_FEATS_P2={N_FEATS_P2}")
     print(f"MP windows={MP_WINDOWS}  extra rolling={EXTRA_ROLL_W}  FFT broadcast=4")
@@ -933,7 +860,12 @@ if __name__ == "__main__":
 
     _load_tda_cache()
 
-    pseudo_labels=load_pseudo_labels(PSEUDO_SOURCE)
+    if not PSEUDO_SOURCE.exists():
+        print(f"Pseudo-label source not found: {PSEUDO_SOURCE}")
+        print("Silently falling back to PSEUDO_WEIGHT = 0 (no pseudo-labels)\n")
+        pseudo_labels = {}
+    else:
+        pseudo_labels=load_pseudo_labels(PSEUDO_SOURCE)
     n_with=sum(1 for v in pseudo_labels.values() if v.sum()>0)
     print(f"Loaded {len(pseudo_labels)} pseudo-label windows, {n_with} with anomalies\n")
 

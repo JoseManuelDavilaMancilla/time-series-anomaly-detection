@@ -1,24 +1,22 @@
 """
-author v71_segments — v71 with contiguous segment selection instead of top-k.
+author v71_cnn — v71 + 1D CNN ensemble add-on (3 seeds, 32-pt context).
 
-Four new additions on top of v68 (108/115 features):
+Five additions on top of v68 (108/115 features):
 
 1. CATCH22 (22 window-level broadcast features)
    Canonical time-series features from the hctsa toolbox.
-   Computed on test_x, broadcast to all points. Captures distribution,
-   autocorrelation, nonlinear dynamics, periodicity, spectral structure.
 
 2. COMPLEXITY STREAM (3 window-level features)
    sample_entropy, permutation_entropy (order=3), lempel_ziv_complexity.
-   Broadcast to all points. Anomalous windows often have different complexity.
 
 3. PER-METRIC RULES (6 per-point features)
    Domain-specific threshold features for each of the 6 metric types.
-   For a given window, 5 features = 0 and 1 has actual metric-specific values.
-   Encodes professor-designed domain knowledge about each metric.
 
 4. CatBoost as 4th model type in ensemble.
-   Blend: 0.65*HGBT + 0.15*CatBoost + 0.10*RF + 0.10*LR.
+
+5. 1D CNN ENSEMBLE (3 seeds, ~465 params each)
+   Sliding windows of context=32 over raw time series.
+   Blend: 0.55*HGBT + 0.15*CatBoost + 0.10*RF + 0.10*LR + 0.10*CNN.
 
 N_FEATS_P1: 108 + 22 + 3 + 6 = 139
 N_FEATS_P2: 115 + 22 + 3 + 6 = 146
@@ -79,6 +77,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 from validation import all_window_dirs, load_window
 from cross_validation import cross_window_evaluate, print_summary_v2
 from validation import stratified_holdout
+from cnn_addon import CNNEnsemble
 
 
 METRIC_TYPES    = ("Count", "ErrorCount", "LatencySecond", "QPS",
@@ -101,9 +100,10 @@ N_FEATS_P1      = 77 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_F
 N_FEATS_P2      = 84 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_FFT_BROAD + N_STL_AR_FEATS + N_CATCH22_FEATS + N_COMPLEX_FEATS + N_PMRULE_FEATS  # 146
 PSEUDO_WEIGHT   = 0.70
 PSEUDO_SOURCE   = Path("submission_v68_stl_ar.json")
-CACHE_DIR       = Path("../tda_cache")
+CACHE_DIR       = Path("tda_cache")
 MP_WINDOWS      = [5, 10, 20]
 EXTRA_ROLL_W    = [3, 7, 63]
+CNN_WEIGHT      = 0.10
 
 
 # ─────────────────────────────────────────────
@@ -706,6 +706,36 @@ def _build_pool_p2(window_dirs,top_services,target_mt,train_gs,test_gs,
 
 
 # ─────────────────────────────────────────────
+# CNN pool builder
+# ─────────────────────────────────────────────
+
+def _build_cnn_pool(window_dirs,target_mt,pseudo_labels=None,wid_map=None):
+    """Collect raw time series + labels for CNN training (mirrors P1 + pseudo-labels)."""
+    raw_list,label_list=[],[]
+    for wdir in window_dirs:
+        info=json.loads((wdir/"info.json").read_text())
+        if info.get("metric_type")!=target_mt: continue
+        try: train_y=np.load(wdir/"train_label.npy")
+        except FileNotFoundError: continue
+        if train_y.sum()==0: continue
+        train_x=np.load(wdir/"train.npy")
+        raw_list.append(train_x.astype(np.float64))
+        label_list.append(train_y.astype(np.int64))
+    if pseudo_labels and wid_map:
+        for wid,pseudo_y in pseudo_labels.items():
+            if pseudo_y.sum()==0: continue
+            wdir=wid_map.get(wid)
+            if wdir is None: continue
+            info=json.loads((wdir/"info.json").read_text())
+            if info.get("metric_type")!=target_mt: continue
+            test_x,test_ts=_load_test_arrays(wdir,info)
+            if len(test_x)!=len(pseudo_y): continue
+            raw_list.append(test_x.astype(np.float64))
+            label_list.append(pseudo_y.astype(np.int64))
+    return raw_list,label_list
+
+
+# ─────────────────────────────────────────────
 # Ensemble
 # ─────────────────────────────────────────────
 
@@ -759,12 +789,14 @@ def fit_both_ensembles(window_dirs,top_services,train_gs,test_gs,
 # Inference
 # ─────────────────────────────────────────────
 
-def _score_bundle(bundle,X):
+def _score_bundle(bundle,X,cnn_prob=None):
     X_sc=bundle["scaler"].transform(X)
     rf_avg=np.mean([c.predict_proba(X)[:,1] for c in bundle["rfs"]],axis=0)
     hgbt_avg=np.mean([c.predict_proba(X)[:,1] for c in bundle["hgbts"]],axis=0)
     lr_p=bundle["lr"].predict_proba(X_sc)[:,1]
     cb_p=bundle["cb"].predict_proba(X)[:,1]
+    if cnn_prob is not None:
+        return (0.65-CNN_WEIGHT)*hgbt_avg+0.15*cb_p+0.10*rf_avg+0.10*lr_p+CNN_WEIGHT*cnn_prob
     return 0.65*hgbt_avg+0.15*cb_p+0.10*rf_avg+0.10*lr_p
 
 def predict_proba_window(test_x,test_ts,train_x_ref,info,service,top_services,
@@ -773,10 +805,13 @@ def predict_proba_window(test_x,test_ts,train_x_ref,info,service,top_services,
     if mt not in ensembles: mt=next(iter(ensembles))
     bundle=ensembles[mt]
     X1=make_features(test_x,test_ts,train_x_ref,info,service,top_services,win_global,wid_str,"test")
-    p1=_score_bundle(bundle["p1"],X1)
+    cnn_prob=None
+    if bundle.get("cnn") is not None:
+        cnn_prob=bundle["cnn"].predict_proba(test_x.astype(np.float32))
+    p1=_score_bundle(bundle["p1"],X1,cnn_prob=cnn_prob)
     if bundle["p2"] is not None:
         X2=make_features_shift(test_x,test_ts,train_x_ref,info,service,top_services,win_global,wid_str,"test")
-        p2=_score_bundle(bundle["p2"],X2)
+        p2=_score_bundle(bundle["p2"],X2,cnn_prob=cnn_prob)
         return (1.-W_SHIFT)*p1+W_SHIFT*p2
     return p1
 
@@ -789,83 +824,6 @@ def smooth_centered(p,w=SMOOTH_W):
     elif len(out)<len(p): out=np.convolve(p,kernel,mode="same")
     return out
 
-def predict_segments(score, k, smooth_w=3, thr_frac=0.7):
-    """Grow contiguous segments from peaks; fallback to top-k for small k."""
-    n = len(score)
-    k = max(0, min(k, n))
-    if k == 0:
-        return np.zeros(n, dtype=int)
-
-    # Small k fallback: exact top-k on raw score
-    if k <= 4:
-        order = np.argsort(-score)
-        pred = np.zeros(n, dtype=int)
-        pred[order[:k]] = 1
-        return pred
-
-    # Smooth with centered rolling mean
-    smoothed = smooth_centered(score, smooth_w)
-
-    # Threshold: peaks above thr_frac * max_score
-    thr = thr_frac * float(np.max(smoothed))
-    above = smoothed > thr
-
-    # Fallback to top-k if nothing crosses threshold
-    if not above.any():
-        order = np.argsort(-smoothed)
-        pred = np.zeros(n, dtype=int)
-        pred[order[:k]] = 1
-        return pred
-
-    # Find contiguous segments (connected components of above-threshold mask)
-    segments = []
-    in_seg = False
-    start = 0
-    for i in range(n):
-        if above[i]:
-            if not in_seg:
-                start = i
-                in_seg = True
-        else:
-            if in_seg:
-                segments.append((start, i))
-                in_seg = False
-    if in_seg:
-        segments.append((start, n))
-
-    # Score each segment by its peak smoothed value
-    seg_scores = []
-    for s, e in segments:
-        seg_scores.append((float(np.max(smoothed[s:e])), s, e))
-    seg_scores.sort(reverse=True)
-
-    # Greedily select segments until we reach exactly k anomalies
-    selected = np.zeros(n, dtype=bool)
-    count = 0
-    for _, s, e in seg_scores:
-        seg_len = e - s
-        if count + seg_len > k:
-            # Partial segment: take highest-scoring points within it
-            remaining = k - count
-            seg_order = np.argsort(-smoothed[s:e])[:remaining]
-            selected[s + seg_order] = True
-            count += remaining
-            break
-        selected[s:e] = True
-        count += seg_len
-        if count >= k:
-            break
-
-    # Safety: if still short, fill with highest remaining points globally
-    if count < k:
-        remaining = k - count
-        unselected = np.where(~selected)[0]
-        top_remaining = unselected[np.argsort(-smoothed[unselected])[:remaining]]
-        selected[top_remaining] = True
-
-    return selected.astype(int)
-
-
 def predict_window(test_x,test_ts,train_x_ref,info,service,top_services,
                    ensembles,win_global=(0.,0.,0.),wid_str=""):
     n=len(test_x)
@@ -875,7 +833,9 @@ def predict_window(test_x,test_ts,train_x_ref,info,service,top_services,
                               top_services,ensembles,win_global,wid_str)
     rm=smooth_centered(prob,SMOOTH_W)
     prob_f=(1.-SMOOTH_ALPHA)*prob+SMOOTH_ALPHA*rm
-    return predict_segments(prob_f, k)
+    order=np.lexsort((np.arange(n),-prob_f))
+    pred=np.zeros(n,dtype=int); pred[order[:k]]=1
+    return pred
 
 
 # ─────────────────────────────────────────────
@@ -905,7 +865,7 @@ def run_validation(pseudo_labels,wid_map):
 
 
 def generate_submission(ensembles,top_services,test_gs,
-                        output=Path("submission_v71_catch22.json")):
+                        output=Path("submission_v71_cnn.json")):
     print(f"\n>>> Generating predictions on 1000 test windows…")
     preds={}; t0=time.time()
     for i,wdir in enumerate(all_window_dirs(),1):
@@ -926,7 +886,7 @@ if __name__ == "__main__":
     print(f"Pseudo-label source: {PSEUDO_SOURCE}")
     print(f"N_FEATS_P1={N_FEATS_P1}  N_FEATS_P2={N_FEATS_P2}")
     print(f"MP windows={MP_WINDOWS}  extra rolling={EXTRA_ROLL_W}  FFT broadcast=4")
-    print(f"PSEUDO_WEIGHT={PSEUDO_WEIGHT}\n")
+    print(f"PSEUDO_WEIGHT={PSEUDO_WEIGHT}  CNN_WEIGHT={CNN_WEIGHT}\n")
 
     print(">>> Warming up stumpy JIT…")
     _warmup_stumpy()
@@ -949,4 +909,4 @@ if __name__ == "__main__":
     ensembles=fit_both_ensembles(all_window_dirs(),top_sv,train_gs,test_gs,pseudo_labels,wid_map)
     print(f"    full fit {time.time()-t0:.1f}s")
     generate_submission(ensembles,top_sv,test_gs)
-    print("\nDone. Submit submission_v71_catch22.json")
+    print("\nDone. Submit submission_v71_cnn.json")
