@@ -1,37 +1,28 @@
 """
-author v69 — Pseudo-label iteration from v68 (0.6905 LB).
+author v67 — Extended MP windows (6 scales) + CUSUM path-dependent features.
 
-A time series professor would grade by: do you detect CONTEXTUAL anomalies —
-values that are normal globally but anomalous given what the seasonal pattern
-EXPECTS at this timestamp?
+Two additions on top of v65 (105/112 features):
 
-Two new signal classes added on top of v65 (105/112 features):
+1. EXTENDED MATRIX PROFILE — add m=3,15,30 to existing m=5,10,20 → 6 total
+   m=3  captures very short spikes/pulses (3-point anomalies)
+   m=15 fills gap between 10 and 20
+   m=30 captures medium-length anomaly segments (mean segment len=17)
+   Same normalized discord score as v65. +3 per-point features.
 
-1. AR(1) FORECAST RESIDUAL — 1 per-point feature
-   Fit AR(1) model on training (phi = autocorr of train_x).
-   For each test point: residual = observed - AR_predicted.
-   Measures: is this point surprising given the previous point + learned dynamics?
-   Different from rolling mean: uses learned mean-reversion dynamics of training.
+2. CUSUM PATH-DEPENDENT FEATURES — 2 per-point features
+   S_pos[i] = max(0, S_pos[i-1] + z[i] - k)   (accumulated upward deviation)
+   S_neg[i] = max(0, S_neg[i-1] - z[i] - k)   (accumulated downward deviation)
+   Where z[i] = (x[i] - train_mean) / train_std, k=0.5 slack.
+   Path-dependent: captures SUSTAINED level shifts (not just local excursions).
+   Fundamentally different from rolling stats (which are window-local).
 
-2. STL SEASONAL DECOMPOSITION RESIDUAL — 1 per-point feature
-   For 3600s intervals (24 pts/day): STL with daily period → residual z-score.
-   For 1200s/864s intervals (72/100 pts/day): STL with daily period if enough data.
-   For others: linear detrend residual.
-   Measures: is this point anomalous given the learned seasonal + trend pattern?
-   CATCHES: contextual anomalies (e.g., value is normal in isolation but wrong
-   for this time-of-day given the daily cycle learned from training).
-
-3. CUMULATIVE AR RESIDUAL — 1 per-point feature
-   Running mean of |AR residuals| up to time t.
-   Path-dependent: captures sustained excursions above/below expected AR path.
-
-N_FEATS_P1: 105 + 3 = 108
-N_FEATS_P2: 112 + 3 = 115
+N_FEATS_P1: 105 + 3 (MP) + 2 (CUSUM) = 110
+N_FEATS_P2: 112 + 3 + 2 = 117
 
 Pseudo-labels: submission_v65_matrix_profile.json (LB 0.6890).
 PSEUDO_WEIGHT: 0.70.
 
-Run:  uv run python v68_stl_ar.py
+Run:  uv run python v67_more_mp_cusum.py
 """
 
 from __future__ import annotations
@@ -67,16 +58,17 @@ W_SHIFT         = 0.30
 SPLIT_FRAC      = 0.70
 N_TDA_FEATS     = 10
 N_FFT_FEATS     = 5
-N_MP_FEATS      = 3    # matrix profile at m=5,10,20
+N_MP_FEATS      = 6    # matrix profile at m=3,5,10,15,20,30
+N_CUSUM_FEATS   = 2    # path-dependent cumulative deviation features
 N_STL_AR_FEATS  = 3    # AR(1) residual + STL/trend residual + cumulative AR
 N_ROLL_NEW      = 6    # mean+std at w=3,7,63
 N_FFT_BROAD     = 4    # top1/2/3 mag + hf_energy_ratio
-N_FEATS_P1      = 77 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_FFT_BROAD + N_STL_AR_FEATS  # 108
-N_FEATS_P2      = 84 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_FFT_BROAD + N_STL_AR_FEATS  # 115
+N_FEATS_P1      = 77 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_FFT_BROAD + N_CUSUM_FEATS + N_STL_AR_FEATS  # 113
+N_FEATS_P2      = 84 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_FFT_BROAD + N_CUSUM_FEATS + N_STL_AR_FEATS  # 120
 PSEUDO_WEIGHT   = 0.70
 PSEUDO_SOURCE   = Path("submission_v68_stl_ar.json")
 CACHE_DIR       = Path("tda_cache")
-MP_WINDOWS      = [5, 10, 20]
+MP_WINDOWS      = [3, 5, 10, 15, 20, 30]
 EXTRA_ROLL_W    = [3, 7, 63]
 
 
@@ -322,6 +314,25 @@ def _extra_rolling(x: np.ndarray) -> np.ndarray:
 
 
 
+
+def cusum_features(x: np.ndarray, train_x: np.ndarray, k: float = 0.5) -> np.ndarray:
+    """2 per-point path-dependent features: accumulated positive/negative deviations.
+    Path-dependent (unlike rolling stats): captures sustained level shifts.
+    """
+    mu = float(np.mean(train_x))
+    sigma = float(np.std(train_x)) + 1e-9
+    n = len(x)
+    z = (x.astype(np.float64) - mu) / sigma
+    s_pos = np.zeros(n, dtype=np.float64)
+    s_neg = np.zeros(n, dtype=np.float64)
+    for i in range(1, n):
+        s_pos[i] = max(0.0, s_pos[i-1] + z[i] - k)
+        s_neg[i] = max(0.0, s_neg[i-1] - z[i] - k)
+    return np.column_stack([
+        np.clip(s_pos / 10.0, 0.0, 10.0),
+        np.clip(s_neg / 10.0, 0.0, 10.0)
+    ]).astype(np.float32)
+
 # ─────────────────────────────────────────────
 # NEW: STL seasonal decomposition + AR(1) residual features
 # ─────────────────────────────────────────────
@@ -417,28 +428,29 @@ def stl_ar_features(x: np.ndarray, train_x: np.ndarray,
 
 def make_features(x, timestamps, train_x_ref, info, service, top_services,
                   win_global=(0.,0.,0.), wid_str="", kind="train"):
-    """108-feature P1 = 77 base + 5 FFT + 10 TDA + 3 MP + 6 roll + 4 FFT-broad + 3 STL/AR."""
-    base = _base77(x, timestamps, train_x_ref, info, service, top_services, win_global)
-    fft  = _fft_anomaly_features(x, train_x_ref)      # (n, 5)
-    tda  = get_tda(wid_str, kind)                      # (10,)
-    mp   = matrix_profile_features(x)                 # (n, 3)
-    roll = _extra_rolling(x)                           # (n, 6)
-    fft_b = fft_broadcast_features(x)                 # (4,)
-    iv = float(info.get("intervals", 0))
+    """113-feature P1 = 77 base + 5 FFT + 10 TDA + 6 MP + 6 roll + 4 FFT-broad + 2 CUSUM + 3 STL/AR."""
+    base  = _base77(x, timestamps, train_x_ref, info, service, top_services, win_global)
+    fft   = _fft_anomaly_features(x, train_x_ref)      # (n, 5)
+    tda   = get_tda(wid_str, kind)                      # (10,)
+    mp    = matrix_profile_features(x)                 # (n, 6)
+    roll  = _extra_rolling(x)                           # (n, 6)
+    fft_b = fft_broadcast_features(x)                  # (4,)
+    cusum = cusum_features(x, train_x_ref)             # (n, 2)
+    iv    = float(info.get("intervals", 0))
     stl_ar = stl_ar_features(x, train_x_ref, iv, kind) # (n, 3)
     n = len(x)
     out = np.hstack([base, fft,
                       np.tile(tda, (n,1)),
                       mp, roll,
                       np.tile(fft_b, (n,1)),
-                      stl_ar])
+                      cusum, stl_ar])
     np.nan_to_num(out, nan=0.0, posinf=10.0, neginf=-10.0, copy=False)
     return out
 
 
 def make_features_shift(x, timestamps, ref_x, info, service, top_services,
                         win_global=(0.,0.,0.), wid_str="", kind="test"):
-    """115-feature P2 = 108 + 7 shift."""
+    """120-feature P2 = 113 + 7 shift."""
     base = make_features(x, timestamps, ref_x, info, service, top_services,
                          win_global, wid_str, kind)
     n = len(x)
@@ -665,12 +677,12 @@ def run_validation(pseudo_labels,wid_map):
                               service,top_services,ensembles,wg,_wid(window.wdir))
     print(">>> Cross-window LOO on holdout…")
     rep=cross_window_evaluate(predictor,holdout)
-    print_summary_v2(rep,"v69 pseudo-iter from v68 (CW-LOO)")
+    print_summary_v2(rep,"v70 v67+v68 combined (CW-LOO)")
     return rep
 
 
 def generate_submission(ensembles,top_services,test_gs,
-                        output=Path("submission_v69_iter_v68.json")):
+                        output=Path("submission_v70_combined.json")):
     print(f"\n>>> Generating predictions on 1000 test windows…")
     preds={}; t0=time.time()
     for i,wdir in enumerate(all_window_dirs(),1):
@@ -714,4 +726,4 @@ if __name__ == "__main__":
     ensembles=fit_both_ensembles(all_window_dirs(),top_sv,train_gs,test_gs,pseudo_labels,wid_map)
     print(f"    full fit {time.time()-t0:.1f}s")
     generate_submission(ensembles,top_sv,test_gs)
-    print("\nDone. Submit submission_v69_iter_v68.json")
+    print("\nDone. Submit submission_v70_combined.json")
