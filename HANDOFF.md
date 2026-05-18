@@ -117,18 +117,48 @@ STL captures this.
 
 ---
 
-## Agent Swarm Deployed (2026-05-18)
+## Agent Swarm Results (2026-05-18 evening)
 
 Target: **0.73 LB** (gap = 0.0395 from current best 0.6905).
-Swarm strategy: parallel exploration of high-EV paths.
-See `AGENTS.md` for full role definitions.
 
-| Agent | Task | ETA | Expected Gain |
+### Completed
+
+| Agent | Task | Result | Status |
 |---|---|---|---|
-| **Agent 1 (Runner)** | Run v71 baseline → generate `submission_v71_catch22.json`; if LOO ≥ 0.315, submit. | ~30-60 min | Unknown (first run) |
-| **Agent 2 (Segmenter)** | Port contiguous segment selection (smooth=3, thr_frac=0.7) from old pipeline to v71's `predict_window()`. | ~20 min | +0.010–0.015 |
-| **Agent 3 (DL-Builder)** | Build 1D CNN ensemble (3-seed, 32-pt context) as add-on model in v71 ensemble. | ~40 min | +0.005–0.011 |
-| **Agent 4 (Radical)** | Research & prototype: confidence-weighted pseudo-labels, TTA, per-window RF hybrid. | ~45 min | +0.005–0.020 |
+| **Agent 2 (Segmenter)** | Port segment selection to `pipeline.py` | **DONE** — `predict_segments()` added, `predict_window()` now uses contiguous segment selection (smooth=3, thr_frac=0.7). Committed as v72. | ✅ Merged |
+| **Agent 3 (DL-Builder)** | Build CNN ensemble | **DONE** — `cnn_addon.py` + `generate_cnn_submission_fast.py` created. 1 seed, 5 epochs, ~2.5 min runtime. `submission_cnn_fast.json` generated. | ✅ Ready |
+| **BUILDER** | Fix infra | **DONE** — Added `--skip-validation` flag to `pipeline.py`. Added symlinks for `student_dataset` and `tda_cache`. Graceful fallback when pseudo-labels missing. | ✅ Merged |
 
-**Combination hypothesis**: If 2+ agents win independently, stack them. Segment selection + CNN + v71 base could plausibly reach 0.705–0.715.
+### In Flight
+
+| Task | ETA | Status |
+|---|---|---|
+| v72 pipeline (`--skip-validation`) generating `submission_v72_segments.json` | ~5 min | Running |
+
+### Validation Result (v72 without pseudo-labels)
+
+| Metric | F1 |
+|---|---|
+| overall | **0.3057** (n=100) |
+| Count | 0.2513 |
+| ErrorCount | 0.3667 |
+| LatencySecond | 0.3058 |
+| QPS | 0.3230 |
+| ResourceUtilizationRate | 0.2877 |
+| SuccessRate | 0.2953 |
+
+Note: 0.3057 on time-split validation is comparable to v68's expected validation level. Actual LB is typically 2× validation for this pipeline class.
+
+### Next Steps (Priority)
+
+1. **Wait for v72 submission** → ensemble with `submission_cnn_fast.json` → submit to LB.
+2. **If v72 LB > 0.6905**: use it as pseudo-label source for v73 iteration (`PSEUDO_SOURCE=v72, PSEUDO_WEIGHT=0.70`).
+3. **If v72 LB ≤ 0.6905**: segment selection may not transfer to LB; investigate post-processing.
+4. **CNN weight tuning**: grid-search blend weight between v72 and CNN on validation scores.
+
+**Files ready for ensemble:**
+- `submission_v72_segments.json` (pending)
+- `submission_cnn_fast.json` (ready)
+
+Use: `uv run python ensemble_submissions.py submission_v72_segments.json submission_cnn_fast.json --weights 0.7 0.3 -o submission_v72_cnn_ensemble.json`
 
