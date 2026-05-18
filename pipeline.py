@@ -1,22 +1,31 @@
 """
-author v36 — bidirectional segment shift + end-of-window suppression.
+author v37 — clean-room replication of friend's 0.644 approach.
 
-v35 revealed two new patterns:
-  1. **Over-correction**: v34's left-only shift over-corrected; we now have
-     2 windows shifted RIGHT and 2 shifted LEFT (was 5 right, 0 left).
-     Fix: try BOTH directions and pick the one with the highest in-segment
-     score sum.
-  2. **End-of-window spurious segments**: wid=944 and wid=510 have phantom
-     short segments at the end of the window. Fix: when a prediction has 2+
-     segments, drop the smallest if it sits in the last 10% of the window
-     and is much smaller than the main segment.
+Friend's reported pipeline:
+  - Single Random Forest
+  - Per-window smoothing of anomaly probabilities ("anomalies are segments,
+    not single points")
+  - Top-k selection (no threshold) sized by info.json's test_ratio
 
-Three variants tested:
-  A. v34 baseline (left-only, merge=3)
-  B. bidirectional shift (max=2), merge=3
-  C. bidirectional shift (max=2) + EOW suppress, merge=3
+Our existing 0.6238 LB submission has CW RF + per-window RF + CNN ensemble +
+IF-on-test + segment-growth post-processing. Possibly too many moving parts.
 
-Run:  uv run python v36_bidi_shift.py
+Friend's 0.644 was achieved with a much simpler stack — and our recent
+"improvements" (v22/v32/v34) all REGRESSED on LB despite winning validation,
+suggesting our extra channels and segment-growth post-processing may be adding
+noise that doesn't generalize.
+
+This script: strip back to bare minimum and sweep smoothing width.
+
+Variants:
+  - smooth ∈ {1, 3, 5, 7, 9, 11, 13, 15, 21}
+  - top-k via argpartition (no segment-growth, no merge, no shifts)
+  - Cross-window RF on scale-invariant features (same as our existing CW
+    `extract_features(include_value=False)`)
+
+The variant with the highest holdout F1 produces `submission_simple_rf_smooth.json`.
+
+Run:  uv run python v37_simple_rf_smooth.py
 """
 
 from __future__ import annotations
@@ -25,95 +34,86 @@ import json
 import time
 import warnings
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict
 
 import numpy as np
 import torch
+from sklearn.ensemble import RandomForestClassifier
 
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
-from shared_lib import (
-    categorize_window,
-    global_distance_score,
-    isolation_forest_test,
-    normalize_scores,
-    online_ensemble,
-    per_window_rf_score,
-)
-from v6_cnn import SPECIALIZED, build_training_pool as v6_pool
-from v7_cnn_ensemble import CNN_SEEDS, ensemble_cnn_score, fit_cnn_with_seed
-from v22_metadata_features import build_metadata_hybrid, scores_v14_with_meta
-from v32_edge_fix import predict_segments_v32
-from v34_postproc_fixes import extract_segments, fix_merge_close
+from shared_lib import extract_features, predict_topk
 from validation import (
-    all_window_dirs, evaluate, load_window, print_summary, save_report, stratified_holdout,
+    all_window_dirs, evaluate, load_window, point_f1, print_summary, save_report,
+    stratified_holdout, time_split,
 )
 
-SEG_KWARGS = dict(smooth=3, thr_frac=0.7, small_k_cutoff=4, max_seg=60,
-                  edge_pad_mode="reflect", boundary_penalty=0.0, edge_width=5)
-CNN_WEIGHT = 0.35
+
+SMOOTH_WIDTHS = (1, 3, 5, 7, 9, 11, 13, 15, 21)
 
 
-def fix_bidi_shift(pred: np.ndarray, scores: np.ndarray, max_shift: int = 2) -> np.ndarray:
-    """For each segment, try shifts in {-max_shift..+max_shift}. Pick the one
-    with the highest score-sum across the shifted positions. Length is preserved."""
-    n = len(pred)
-    segs = extract_segments(pred)
-    if not segs:
-        return pred
-    new_pred = np.zeros(n, dtype=int)
-    for s, e in segs:
-        seg_len = e - s + 1
-        best_start = s
-        best_score = float(scores[s : e + 1].sum())
-        for shift in range(-max_shift, max_shift + 1):
-            if shift == 0:
+class SimpleCrossWindowRF:
+    """One RF, scale-invariant features, returns per-point P(anomaly)."""
+
+    def __init__(self, n_estimators: int = 500, max_depth: int = 15,
+                 min_samples_leaf: int = 3, seed: int = 42):
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.min_samples_leaf = min_samples_leaf
+        self.seed = seed
+        self.clf: RandomForestClassifier = None
+
+    def fit(self, window_dirs):
+        X_all, y_all = [], []
+        for wdir in window_dirs:
+            try:
+                train_y = np.load(wdir / "train_label.npy")
+            except FileNotFoundError:
                 continue
-            new_s = s + shift
-            new_e = new_s + seg_len - 1
-            if new_s < 0 or new_e >= n:
+            if train_y.sum() == 0:
                 continue
-            cand = float(scores[new_s : new_e + 1].sum())
-            if cand > best_score:
-                best_score = cand
-                best_start = new_s
-        new_pred[best_start : best_start + seg_len] = 1
-    return new_pred
+            train_x = np.load(wdir / "train.npy")
+            X_all.append(extract_features(train_x, include_value=False))
+            y_all.append(train_y)
+        X = np.vstack(X_all); y = np.hstack(y_all)
+        self.clf = RandomForestClassifier(
+            n_estimators=self.n_estimators, max_depth=self.max_depth,
+            min_samples_leaf=self.min_samples_leaf, class_weight="balanced",
+            random_state=self.seed, n_jobs=4,
+        )
+        self.clf.fit(X, y)
+        return self
+
+    def predict_proba(self, test_x: np.ndarray) -> np.ndarray:
+        X = extract_features(test_x, include_value=False)
+        proba = self.clf.predict_proba(X)
+        return proba[:, 1] if proba.shape[1] > 1 else np.zeros(len(test_x))
 
 
-def fix_eow_suppress(pred: np.ndarray, eow_frac: float = 0.10,
-                     min_main_ratio: float = 2.0) -> np.ndarray:
-    """If prediction has 2+ segments, drop the smallest one if:
-      - It sits in the last `eow_frac` of the window AND
-      - It's at most 1/`min_main_ratio` the size of the largest segment
-
-    Returns the modified prediction. The dropped positions become 0."""
-    n = len(pred)
-    segs = extract_segments(pred)
-    if len(segs) < 2:
-        return pred
-    eow_start = int(n * (1 - eow_frac))
-    seg_lengths = [e - s + 1 for s, e in segs]
-    max_len = max(seg_lengths)
-    new_pred = pred.copy()
-    for (s, e), seg_len in zip(segs, seg_lengths):
-        # In last eow_frac of window AND much smaller than the biggest segment
-        if s >= eow_start and seg_len * min_main_ratio <= max_len:
-            new_pred[s : e + 1] = 0
-    return new_pred
+def smooth_proba(p: np.ndarray, width: int) -> np.ndarray:
+    """Per-window centered moving average. Reflective padding for edges."""
+    if width <= 1:
+        return p.copy()
+    half = width // 2
+    padded = np.concatenate([
+        p[half - 1 :: -1] if half > 0 else p[:0],
+        p,
+        p[-1 : -half - 1 : -1] if half > 0 else p[:0],
+    ])
+    kernel = np.ones(width) / width
+    out = np.convolve(padded, kernel, mode="valid")
+    if len(out) > len(p):
+        out = out[: len(p)]
+    elif len(out) < len(p):
+        # Fallback
+        out = np.convolve(p, kernel, mode="same")
+    return out
 
 
-def predict_segments_v36(scores, k, *, do_bidi_shift=True, do_merge=True,
-                         do_eow=True, max_shift=2, merge_gap=3,
-                         eow_frac=0.10, min_main_ratio=2.0, **seg_kwargs):
-    pred = predict_segments_v32(scores, k, **seg_kwargs)
-    if do_bidi_shift:
-        pred = fix_bidi_shift(pred, scores, max_shift=max_shift)
-    if do_merge:
-        pred = fix_merge_close(pred, merge_gap=merge_gap)
-    if do_eow:
-        pred = fix_eow_suppress(pred, eow_frac=eow_frac, min_main_ratio=min_main_ratio)
-    return pred
+def predict_for_window(proba: np.ndarray, smooth_width: int, ratio: float) -> np.ndarray:
+    smoothed = smooth_proba(proba, smooth_width)
+    k = int(round(len(proba) * ratio))
+    return predict_topk(smoothed, k)
 
 
 def run_validation(seed: int = 42) -> dict:
@@ -121,102 +121,75 @@ def run_validation(seed: int = 42) -> dict:
     train_pool, holdout = stratified_holdout(all_window_dirs(), frac=0.10, seed=seed)
     print(f"    train_pool={len(train_pool)}  holdout={len(holdout)}")
 
-    print(">>> Training metadata CW + 3-seed CNN…")
+    print(">>> Training single cross-window RF (scale-invariant features)…")
     t0 = time.time()
-    cw = build_metadata_hybrid(train_pool, mode="intervals")
-    print(f"    cw fit {time.time() - t0:.1f}s")
-    Xc, yc = v6_pool(train_pool)
-    cnn_models = []
-    for s in CNN_SEEDS:
-        t0 = time.time()
-        cnn_models.append(fit_cnn_with_seed(Xc, yc, s))
-        print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
+    rf = SimpleCrossWindowRF().fit(train_pool)
+    print(f"    fit {time.time() - t0:.1f}s")
 
-    # Bring v34 (left-shift only) in for direct comparison
-    from v34_postproc_fixes import predict_segments_v34
+    # Precompute holdout probabilities once
+    print(">>> Pre-computing holdout probabilities…")
+    cached = []
+    for wdir in holdout:
+        w = load_window(wdir)
+        sub_tr_x, sub_tr_y, sub_te_x, sub_te_y = time_split(w.train_x, w.train_y, frac=0.70)
+        ratio = float(sub_te_y.mean()) if len(sub_te_y) else 0.0
+        proba = rf.predict_proba(sub_te_x)
+        cached.append({
+            "wid": w.wid, "metric_type": w.metric_type, "proba": proba,
+            "y_true": sub_te_y, "ratio": ratio, "n": len(sub_te_x),
+        })
 
-    def make_pred_v34():
-        def pred(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
-            scores = scores_v14_with_meta(sub_tr_x, sub_tr_y, sub_te_x, cw, cnn_models,
-                                          info, info.get("metric_type", "ALL"))
-            return predict_segments_v34(scores, int(round(len(sub_te_x) * ratio)),
-                                        do_left_shift=True, do_merge=True,
-                                        max_shift=2, merge_gap=3, relative_thresh=0.95,
-                                        **SEG_KWARGS)
-        return pred
-
-    def make_pred_v36(do_bidi, do_eow, eow_frac=0.10, min_main_ratio=2.0):
-        def pred(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
-            scores = scores_v14_with_meta(sub_tr_x, sub_tr_y, sub_te_x, cw, cnn_models,
-                                          info, info.get("metric_type", "ALL"))
-            return predict_segments_v36(scores, int(round(len(sub_te_x) * ratio)),
-                                        do_bidi_shift=do_bidi, do_merge=True, do_eow=do_eow,
-                                        max_shift=2, merge_gap=3, eow_frac=eow_frac,
-                                        min_main_ratio=min_main_ratio, **SEG_KWARGS)
-        return pred
-
-    variants = {
-        "v34 baseline (left-only, merge)":    make_pred_v34(),
-        "v36 bidi shift, no EOW":             make_pred_v36(True, False),
-        "v36 bidi + EOW (10%, ratio=2.0)":    make_pred_v36(True, True, 0.10, 2.0),
-        "v36 bidi + EOW (15%, ratio=2.0)":    make_pred_v36(True, True, 0.15, 2.0),
-        "v36 bidi + EOW (10%, ratio=3.0)":    make_pred_v36(True, True, 0.10, 3.0),
-        "v36 EOW only (10%, ratio=2.0)":      make_pred_v36(False, True, 0.10, 2.0),
-    }
-
+    print(f">>> Sweeping smoothing widths {SMOOTH_WIDTHS}…")
     results = {}
-    for name, pred_fn in variants.items():
-        print(f"\n>>> Eval [{name}]")
-        rep = evaluate(pred_fn, holdout)
-        print_summary(rep, name=name)
-        results[name] = rep
+    for smooth in SMOOTH_WIDTHS:
+        f1s = []
+        f1_by_metric: Dict[str, list] = {}
+        for c in cached:
+            pred = predict_for_window(c["proba"], smooth, c["ratio"])
+            f1 = point_f1(c["y_true"], pred)
+            f1s.append(f1)
+            f1_by_metric.setdefault(c["metric_type"], []).append(f1)
+        mean_f1 = float(np.mean(f1s))
+        by_metric = {mt: float(np.mean(v)) for mt, v in f1_by_metric.items()}
+        results[smooth] = {"overall_f1": mean_f1, "by_metric": by_metric}
+        print(f"  smooth={smooth:>3}  F1={mean_f1:.4f}  "
+              + "  ".join(f"{mt[:4]}={f1:.3f}" for mt, f1 in sorted(by_metric.items())))
 
-    base = results["v34 baseline (left-only, merge)"]["overall_f1"]
     print("\n──────  summary ──────")
     rows = sorted(results.items(), key=lambda kv: -kv[1]["overall_f1"])
-    for name, rep in rows:
-        d = rep["overall_f1"] - base
-        print(f"  {name:<40}  F1={rep['overall_f1']:.4f}  Δ_vs_v34={d:+.4f}")
+    for smooth, r in rows:
+        print(f"  smooth={smooth:>3}  F1={r['overall_f1']:.4f}")
+    winner_smooth = rows[0][0]
+    winner_f1 = rows[0][1]["overall_f1"]
+    print(f"\n  Winner: smooth={winner_smooth}  F1={winner_f1:.4f}")
 
-    winner = rows[0][0]
     report = {
-        "results": {name: r["overall_f1"] for name, r in results.items()},
-        "winner": winner,
-        "delta_vs_v34": rows[0][1]["overall_f1"] - base,
+        "results": {str(s): r["overall_f1"] for s, r in results.items()},
+        "winner_smooth": winner_smooth,
+        "winner_f1": winner_f1,
+        "per_metric": {str(s): r["by_metric"] for s, r in results.items()},
         "seed": seed, "n_holdout": len(holdout),
     }
-    save_report(report, "v36_bidi_shift")
-    return report, cw, cnn_models
+    save_report(report, "v37_simple_rf_smooth")
+    return report, rf
 
 
-def generate_submission(do_bidi, do_eow, eow_frac, min_main_ratio, cw, cnn_models,
-                       output: Path = Path("submission_bidi_eow.json")) -> Path:
-    print(f"\n>>> Re-training on ALL 1000 windows…")
+def generate_submission(smooth_width: int, rf,
+                        output: Path = Path("submission_simple_rf_smooth.json")) -> Path:
+    print(f"\n>>> Re-training RF on ALL 1000 windows…")
     t0 = time.time()
-    cw_full = build_metadata_hybrid(all_window_dirs(), mode="intervals")
-    print(f"    cw fit {time.time() - t0:.1f}s")
+    rf_full = SimpleCrossWindowRF().fit(all_window_dirs())
+    print(f"    fit {time.time() - t0:.1f}s")
 
-    Xc, yc = v6_pool(all_window_dirs())
-    cnn_full = []
-    for s in CNN_SEEDS:
-        t0 = time.time()
-        cnn_full.append(fit_cnn_with_seed(Xc, yc, s))
-        print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
-
-    print(">>> Generating predictions…")
+    print(f">>> Generating predictions with smooth={smooth_width}…")
     preds: dict[str, list[int]] = {}
     t0 = time.time()
     for i, wdir in enumerate(all_window_dirs(), 1):
         w = load_window(wdir)
         ratio = float(w.info.get("test set anomaly ratio", 0.0))
-        scores = scores_v14_with_meta(w.train_x, w.train_y, w.test_x, cw_full, cnn_full,
-                                      w.info, w.metric_type)
-        k = int(round(len(w.test_x) * ratio))
-        preds[w.wid] = predict_segments_v36(
-            scores, k, do_bidi_shift=do_bidi, do_merge=True, do_eow=do_eow,
-            max_shift=2, merge_gap=3, eow_frac=eow_frac, min_main_ratio=min_main_ratio,
-            **SEG_KWARGS
-        ).astype(int).tolist()
+        proba = rf_full.predict_proba(w.test_x)
+        pred = predict_for_window(proba, smooth_width, ratio)
+        preds[w.wid] = pred.astype(int).tolist()
         if i % 100 == 0:
             print(f"    {i}/1000 ({time.time() - t0:.0f}s)")
 
@@ -229,20 +202,33 @@ def generate_submission(do_bidi, do_eow, eow_frac, min_main_ratio, cw, cnn_model
     return output
 
 
-VARIANT_PARAMS = {
-    "v36 bidi shift, no EOW":             (True, False, 0.10, 2.0),
-    "v36 bidi + EOW (10%, ratio=2.0)":    (True, True, 0.10, 2.0),
-    "v36 bidi + EOW (15%, ratio=2.0)":    (True, True, 0.15, 2.0),
-    "v36 bidi + EOW (10%, ratio=3.0)":    (True, True, 0.10, 3.0),
-    "v36 EOW only (10%, ratio=2.0)":      (False, True, 0.10, 2.0),
-}
-
 if __name__ == "__main__":
-    rep, cw, cnn_models = run_validation()
-    if rep["winner"] != "v34 baseline (left-only, merge)" and rep["delta_vs_v34"] > 0.0005:
-        do_bidi, do_eow, eow_frac, min_ratio = VARIANT_PARAMS[rep["winner"]]
-        print(f"\n{rep['winner']} beats v34 by {rep['delta_vs_v34']:+.4f}; generating submission.")
-        generate_submission(do_bidi, do_eow, eow_frac, min_ratio, cw, cnn_models)
-    else:
-        print(f"\nv36 did not meaningfully help (best Δ_vs_v34 = {rep['delta_vs_v34']:+.4f}); "
-              "submission NOT generated.")
+    rep, _ = run_validation()
+    # Generate for the best smoothing width; also save a couple of alternates so
+    # the user can pick if validation isn't trustworthy
+    rf_full_done = None
+    target_widths = [rep["winner_smooth"]]
+    # Also save smooth=5 and smooth=11 as alternates
+    for w in (5, 11):
+        if w != rep["winner_smooth"]:
+            target_widths.append(w)
+
+    print(f"\n>>> Re-training RF on ALL 1000 windows (once)…")
+    t0 = time.time()
+    rf_full = SimpleCrossWindowRF().fit(all_window_dirs())
+    print(f"    fit {time.time() - t0:.1f}s")
+
+    for w in target_widths:
+        print(f">>> Generating submission for smooth={w}…")
+        preds = {}
+        for wdir in all_window_dirs():
+            wnd = load_window(wdir)
+            ratio = float(wnd.info.get("test set anomaly ratio", 0.0))
+            proba = rf_full.predict_proba(wnd.test_x)
+            pred = predict_for_window(proba, w, ratio)
+            preds[wnd.wid] = pred.astype(int).tolist()
+        assert len(preds) == 1000
+        out = Path(f"submission_simple_rf_smooth_{w}.json")
+        out.write_text(json.dumps({"predictions": preds}, ensure_ascii=False, separators=(",", ":")),
+                       encoding="utf-8")
+        print(f"  wrote {out}")
