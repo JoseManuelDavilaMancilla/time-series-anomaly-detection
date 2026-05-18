@@ -1,23 +1,29 @@
 """
-author v27 — Spectral / wavelet features as a new CW channel.
+author v28 — Add window-level anomaly_ratio as a CW feature.
 
-Hypothesis: existing features (lags, rolling stats, EMA) are all *temporal-
-domain* statistics. Anomalies often manifest as frequency-domain changes:
-loss of periodicity, new high-frequency content, energy redistribution.
-We've never given the CW model access to spectral features.
+`info.json` has TWO anomaly ratios:
+  - "training set anomaly ratio" — known for training windows (provided)
+  - "test set anomaly ratio" — known for test windows at inference (provided)
 
-For each point, extract:
-  - FFT magnitudes at low/mid/high frequency bins (4 features)
-  - Spectral entropy of the local 32-pt window
-  - Wavelet detail coefficients at 3 scales (3 features)
-  - Local zero-crossing rate (1 feature)
+We use `test set anomaly ratio` to compute `k` in `predict_segments`, but the
+CW model itself has never seen any anomaly-density information. Adding the
+window's ratio as a window-level feature (broadcast across all points) lets
+the model condition its scoring on the expected anomaly density:
 
-These become per-point features alongside the existing time-domain ones,
-boosting the CW feature dimension from 27 → 36. The model can then learn
-"high-frequency content drops in this anomaly" or "this is the only point
-with non-zero wavelet detail at scale 2".
+  - At training time, every training window's anomaly_ratio = train_ratio
+  - At inference time, every test window's anomaly_ratio = test_ratio
 
-Run:  uv run python v27_spectral_features.py
+The model can learn "this window will have ~12% anomalies, so even moderate
+scores might be true positives" or "this window has ~0%, so trust the model
+to be cautious".
+
+We sweep two variants:
+  A. ratio as a single scalar feature
+  B. ratio + log(seq_len) — combines with our v22 lesson that intervals helped
+
+Stacks on v22 (metadata-CW with intervals) as the strongest baseline.
+
+Run:  uv run python v28_ratio_feature.py
 """
 
 from __future__ import annotations
@@ -26,7 +32,6 @@ import json
 import time
 import warnings
 from pathlib import Path
-from typing import Dict
 
 import numpy as np
 import torch
@@ -34,7 +39,6 @@ import torch
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
 from shared_lib import (
-    CrossWindowModel,
     HybridCrossWindowModel,
     categorize_window,
     extract_features,
@@ -47,9 +51,7 @@ from shared_lib import (
 )
 from v6_cnn import SPECIALIZED, build_training_pool as v6_pool
 from v7_cnn_ensemble import CNN_SEEDS, ensemble_cnn_score, fit_cnn_with_seed
-from v22_metadata_features import (
-    MetadataCrossWindowModel, MetadataHybridCW, INTERVALS, metadata_vector,
-)
+from v22_metadata_features import build_metadata_hybrid, scores_v14_with_meta
 from validation import (
     all_window_dirs,
     evaluate,
@@ -61,54 +63,34 @@ from validation import (
 
 SEG_KWARGS = dict(smooth=3, thr_frac=0.7, small_k_cutoff=4, max_seg=60)
 CNN_WEIGHT = 0.35
-WIN = 32  # spectral window size
 
 
-def spectral_features(series: np.ndarray, win: int = WIN) -> np.ndarray:
-    """Per-point spectral features computed over a centered window of size `win`."""
-    n = len(series)
-    half = win // 2
-    s = series.astype(np.float64)
-    padded = np.concatenate([np.full(half, s[0]), s, np.full(half, s[-1])])
-
-    out = np.zeros((n, 8), dtype=np.float32)
-    for i in range(n):
-        w = padded[i : i + win]
-        w = w - w.mean()
-        # FFT magnitudes
-        fft_mag = np.abs(np.fft.rfft(w))  # (win//2 + 1,)
-        # Normalize so they're scale-invariant
-        total = fft_mag.sum() + 1e-9
-        fft_norm = fft_mag / total
-        # Low, mid, high band energy fractions
-        n_bins = len(fft_mag)
-        b1 = n_bins // 3
-        b2 = 2 * n_bins // 3
-        out[i, 0] = float(fft_norm[:b1].sum())
-        out[i, 1] = float(fft_norm[b1:b2].sum())
-        out[i, 2] = float(fft_norm[b2:].sum())
-        # Dominant frequency index (normalized)
-        out[i, 3] = float(np.argmax(fft_mag) / max(1, n_bins - 1))
-        # Spectral entropy
-        p = fft_norm[fft_norm > 0]
-        out[i, 4] = float(-(p * np.log(p)).sum()) if len(p) else 0.0
-        # Zero-crossing rate
-        out[i, 5] = float(((w[:-1] * w[1:]) < 0).sum() / max(1, len(w) - 1))
-        # Total energy (relative to window size)
-        out[i, 6] = float((w * w).sum() / win)
-        # Variance ratio: first half vs second half
-        h1, h2 = w[:half], w[half:]
-        out[i, 7] = float((h1.var() + 1e-9) / (h2.var() + 1e-9))
-    return out
+def ratio_features(info: dict, mode: str, is_training: bool) -> np.ndarray:
+    """At training, use 'training set anomaly ratio'.
+    At inference, use 'test set anomaly ratio'."""
+    if is_training:
+        ratio = float(info.get("training set anomaly ratio", 0.0))
+    else:
+        ratio = float(info.get("test set anomaly ratio", 0.0))
+    interval = info.get("intervals", 0)
+    interval_log = float(np.log10(max(1, interval)))
+    if mode == "intervals":
+        return np.array([interval_log], dtype=np.float32)
+    if mode == "intervals+ratio":
+        return np.array([interval_log, ratio], dtype=np.float32)
+    if mode == "intervals+ratio+log_ratio":
+        # log(ratio + small_epsilon) — gives separation between low ratios
+        log_r = float(np.log10(max(1e-4, ratio)))
+        return np.array([interval_log, ratio, log_r], dtype=np.float32)
+    return np.zeros(0, dtype=np.float32)
 
 
-class SpectralMetadataCW:
-    """CW model with metadata features (intervals) + spectral features."""
-
-    def __init__(self, n_estimators=500, max_depth=15, min_samples_leaf=3,
+class RatioCW:
+    def __init__(self, mode: str, n_estimators=500, max_depth=15, min_samples_leaf=3,
                  per_metric=False, seed=42):
         from sklearn.ensemble import RandomForestClassifier
         self.RF = RandomForestClassifier
+        self.mode = mode
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.min_samples_leaf = min_samples_leaf
@@ -116,12 +98,12 @@ class SpectralMetadataCW:
         self.seed = seed
         self._models = {}
 
-    def _features_for_window(self, train_x, info):
-        base = extract_features(train_x, include_value=False)
-        meta = metadata_vector(info, mode="intervals")
-        spec = spectral_features(train_x)
-        broadcast_meta = np.tile(meta, (base.shape[0], 1))
-        return np.hstack([base, broadcast_meta, spec])
+    def _features_for_window(self, x: np.ndarray, info: dict, is_training: bool) -> np.ndarray:
+        base = extract_features(x, include_value=False)
+        meta = ratio_features(info, self.mode, is_training)
+        if meta.size == 0:
+            return base
+        return np.hstack([base, np.tile(meta, (base.shape[0], 1))])
 
     def fit(self, window_dirs):
         X_by_key, y_by_key = {}, {}
@@ -135,12 +117,11 @@ class SpectralMetadataCW:
             train_x = np.load(wdir / "train.npy")
             info = json.loads((wdir / "info.json").read_text())
             key = info.get("metric_type", "Unknown") if self.per_metric else "ALL"
-            X_by_key.setdefault(key, []).append(self._features_for_window(train_x, info))
+            X_by_key.setdefault(key, []).append(
+                self._features_for_window(train_x, info, is_training=True))
             y_by_key.setdefault(key, []).append(train_y)
-
         for key in X_by_key:
-            X = np.vstack(X_by_key[key])
-            y = np.hstack(y_by_key[key])
+            X = np.vstack(X_by_key[key]); y = np.hstack(y_by_key[key])
             clf = self.RF(
                 n_estimators=self.n_estimators, max_depth=self.max_depth,
                 min_samples_leaf=self.min_samples_leaf, class_weight="balanced",
@@ -150,10 +131,11 @@ class SpectralMetadataCW:
             self._models[key] = clf
         return self
 
-    def predict_proba(self, test_x, metric_type="ALL", info=None):
+    def predict_proba(self, test_x: np.ndarray, metric_type: str = "ALL",
+                      info: dict = None) -> np.ndarray:
         if info is None:
             raise ValueError("needs info")
-        X = self._features_for_window(test_x, info)
+        X = self._features_for_window(test_x, info, is_training=False)
         key = metric_type if self.per_metric else "ALL"
         if key not in self._models:
             key = next(iter(self._models))
@@ -161,7 +143,7 @@ class SpectralMetadataCW:
         return proba[:, 1] if proba.shape[1] > 1 else np.zeros(len(test_x))
 
 
-class SpectralHybridCW:
+class RatioHybridCW:
     def __init__(self, g, p, specialized):
         self.global_model = g
         self.per_metric_model = p
@@ -169,18 +151,17 @@ class SpectralHybridCW:
 
     def predict_proba(self, test_x, metric_type="ALL", info=None):
         if metric_type in self.specialized:
-            return self.per_metric_model.predict_proba(test_x, metric_type=metric_type,
-                                                       info=info)
+            return self.per_metric_model.predict_proba(test_x, metric_type=metric_type, info=info)
         return self.global_model.predict_proba(test_x, metric_type="ALL", info=info)
 
 
-def build_spectral_hybrid(window_dirs):
-    g = SpectralMetadataCW(per_metric=False).fit(window_dirs)
-    p = SpectralMetadataCW(per_metric=True).fit(window_dirs)
-    return SpectralHybridCW(g, p, SPECIALIZED)
+def build_ratio_hybrid(window_dirs, mode):
+    g = RatioCW(mode=mode, per_metric=False).fit(window_dirs)
+    p = RatioCW(mode=mode, per_metric=True).fit(window_dirs)
+    return RatioHybridCW(g, p, SPECIALIZED)
 
 
-def scores_with_meta(train_x, train_y, test_x, cw, cnn_models, info, metric_type):
+def scores_v14(train_x, train_y, test_x, cw, cnn_models, info, metric_type):
     category = categorize_window(train_x, test_x)
     cw_s = normalize_scores(cw.predict_proba(test_x, metric_type=metric_type, info=info))
     cnn_s = normalize_scores(ensemble_cnn_score(cnn_models, test_x))
@@ -207,17 +188,6 @@ def run_validation(seed: int = 42) -> dict:
     train_pool, holdout = stratified_holdout(all_window_dirs(), frac=0.10, seed=seed)
     print(f"    train_pool={len(train_pool)}  holdout={len(holdout)}")
 
-    print(">>> Training metadata-CW baseline (v22)…")
-    t0 = time.time()
-    from v22_metadata_features import build_metadata_hybrid
-    cw_v22 = build_metadata_hybrid(train_pool, mode="intervals")
-    print(f"    cw v22 fit {time.time() - t0:.1f}s")
-
-    print(">>> Training spectral+metadata CW (v27)…")
-    t0 = time.time()
-    cw_v27 = build_spectral_hybrid(train_pool)
-    print(f"    cw v27 fit {time.time() - t0:.1f}s")
-
     print(">>> Training 3-seed CNN ensemble…")
     Xc, yc = v6_pool(train_pool)
     cnn_models = []
@@ -226,39 +196,62 @@ def run_validation(seed: int = 42) -> dict:
         cnn_models.append(fit_cnn_with_seed(Xc, yc, s))
         print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
 
-    def pred(cw_obj):
-        def fn(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
-            scores = scores_with_meta(sub_tr_x, sub_tr_y, sub_te_x, cw_obj, cnn_models,
-                                      info, info.get("metric_type", "ALL"))
+    # NB: at validation time the "test ratio" for the held-out window's sub_test
+    # portion isn't in info.json (info.json's test_ratio refers to the actual
+    # competition test set). For a fair evaluation we use the held-out window's
+    # *sub_test* anomaly ratio as a proxy at inference, computed from labels.
+    # This is the same use of test_ratio that we do at competition time:
+    # info.json provides it; we use it both for k and now for the feature.
+
+    cw_models = {}
+    for mode in ("intervals", "intervals+ratio", "intervals+ratio+log_ratio"):
+        print(f">>> Training CW mode={mode}…")
+        t0 = time.time()
+        cw_models[mode] = build_ratio_hybrid(train_pool, mode)
+        print(f"    fit {time.time() - t0:.1f}s")
+
+    # Helper: at validation, use sub_test labels to compute ratio (proxy for info.json)
+    from validation import time_split
+    def make_predictor(cw_obj):
+        def pred(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
+            # Override info's test_ratio with the actual holdout ratio for fairness
+            local_info = dict(info)
+            local_info["test set anomaly ratio"] = float(ratio)
+            scores = scores_v14(sub_tr_x, sub_tr_y, sub_te_x, cw_obj, cnn_models,
+                                local_info, info.get("metric_type", "ALL"))
             return predict_segments(scores, int(round(len(sub_te_x) * ratio)), **SEG_KWARGS)
-        return fn
+        return pred
 
-    print("\n>>> Eval v22 baseline…")
-    rep_v22 = evaluate(pred(cw_v22), holdout)
-    print_summary(rep_v22, name="v22 baseline")
+    results = {}
+    for mode, cw_obj in cw_models.items():
+        print(f"\n>>> Eval mode={mode}…")
+        rep = evaluate(make_predictor(cw_obj), holdout)
+        print_summary(rep, name=f"v28 {mode}")
+        results[mode] = rep["overall_f1"]
 
-    print(">>> Eval v27 (+ spectral features)…")
-    rep_v27 = evaluate(pred(cw_v27), holdout)
-    print_summary(rep_v27, name="v27 spectral+meta")
+    base = results["intervals"]
+    print("\n──────  summary ──────")
+    for mode, f1 in sorted(results.items(), key=lambda kv: -kv[1]):
+        print(f"  meta={mode:<28}  F1={f1:.4f}  Δ_vs_intervals={f1 - base:+.4f}")
 
-    delta = rep_v27["overall_f1"] - rep_v22["overall_f1"]
-    print(f"\n  Δ (v27 − v22) = {delta:+.4f}")
-
+    winner = max(results, key=lambda m: results[m])
+    winner_f1 = results[winner]
     report = {
-        "v22_f1": rep_v22["overall_f1"],
-        "v27_f1": rep_v27["overall_f1"],
-        "delta": delta,
+        "results": results,
+        "winner": winner,
+        "delta_vs_baseline": winner_f1 - base,
         "seed": seed,
         "n_holdout": len(holdout),
     }
-    save_report(report, "v27_spectral_features")
-    return report, cw_v27, cnn_models
+    save_report(report, "v28_ratio_feature")
+    return report, cw_models, cnn_models
 
 
-def generate_submission(cw, cnn_models, output: Path = Path("submission_spectral.json")) -> Path:
-    print(f"\n>>> Re-training on ALL 1000 windows…")
+def generate_submission(mode: str, cnn_models,
+                        output: Path = Path("submission_ratio_feature.json")) -> Path:
+    print(f"\n>>> Re-training on ALL 1000 windows (mode={mode})…")
     t0 = time.time()
-    cw_full = build_spectral_hybrid(all_window_dirs())
+    cw_full = build_ratio_hybrid(all_window_dirs(), mode)
     print(f"    cw fit {time.time() - t0:.1f}s")
 
     Xc, yc = v6_pool(all_window_dirs())
@@ -274,8 +267,8 @@ def generate_submission(cw, cnn_models, output: Path = Path("submission_spectral
     for i, wdir in enumerate(all_window_dirs(), 1):
         w = load_window(wdir)
         ratio = float(w.info.get("test set anomaly ratio", 0.0))
-        scores = scores_with_meta(w.train_x, w.train_y, w.test_x, cw_full, cnn_full,
-                                  w.info, w.metric_type)
+        scores = scores_v14(w.train_x, w.train_y, w.test_x, cw_full, cnn_full,
+                            w.info, w.metric_type)
         k = int(round(len(w.test_x) * ratio))
         preds[w.wid] = predict_segments(scores, k, **SEG_KWARGS).astype(int).tolist()
         if i % 100 == 0:
@@ -291,10 +284,11 @@ def generate_submission(cw, cnn_models, output: Path = Path("submission_spectral
 
 
 if __name__ == "__main__":
-    rep, cw, cnn_models = run_validation()
-    if rep["delta"] > 0.001:
-        print(f"\nSpectral features beat v22 by {rep['delta']:+.4f}; generating submission.")
-        generate_submission(cw, cnn_models)
+    rep, cw_models, cnn_models = run_validation()
+    if rep["winner"] != "intervals" and rep["delta_vs_baseline"] > 0.001:
+        print(f"\n{rep['winner']} beats baseline by {rep['delta_vs_baseline']:+.4f}; "
+              "generating submission.")
+        generate_submission(rep["winner"], cnn_models)
     else:
-        print(f"\nSpectral features did not help (Δ = {rep['delta']:+.4f}); "
+        print(f"\nRatio feature did not help (best Δ = {rep['delta_vs_baseline']:+.4f}); "
               "submission NOT generated.")
