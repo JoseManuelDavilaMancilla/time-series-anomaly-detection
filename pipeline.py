@@ -933,9 +933,13 @@ if __name__ == "__main__":
 
     _load_tda_cache()
 
-    pseudo_labels=load_pseudo_labels(PSEUDO_SOURCE)
-    n_with=sum(1 for v in pseudo_labels.values() if v.sum()>0)
-    print(f"Loaded {len(pseudo_labels)} pseudo-label windows, {n_with} with anomalies\n")
+    if PSEUDO_SOURCE.exists():
+        pseudo_labels=load_pseudo_labels(PSEUDO_SOURCE)
+        n_with=sum(1 for v in pseudo_labels.values() if v.sum()>0)
+        print(f"Loaded {len(pseudo_labels)} pseudo-label windows, {n_with} with anomalies\n")
+    else:
+        print(f"WARNING: {PSEUDO_SOURCE} not found — running without pseudo-labels\n")
+        pseudo_labels={}
 
     wid_map=build_wid_map(all_window_dirs())
 
@@ -948,5 +952,5 @@ if __name__ == "__main__":
     test_gs=compute_window_global_stats(all_window_dirs(),"test.npy")
     ensembles=fit_both_ensembles(all_window_dirs(),top_sv,train_gs,test_gs,pseudo_labels,wid_map)
     print(f"    full fit {time.time()-t0:.1f}s")
-    generate_submission(ensembles,top_sv,test_gs)
-    print("\nDone. Submit submission_v71_catch22.json")
+    generate_submission(ensembles,top_sv,test_gs,output=Path("submission_v72_segments.json"))
+    print("\nDone. Submit submission_v72_segments.json")
