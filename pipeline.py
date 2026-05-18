@@ -1,15 +1,13 @@
 """
-author v49 — P2 consistent reference at inference.
+author v50 — extended rolling min/max features.
 
-Bug fix vs v43: P2 was trained with ref_x = train_x[:70%], but at inference
-we passed the FULL train_x as ref_x. P2 never saw "shift relative to 100%
-of train" during training → inconsistent feature distribution at inference.
+v43 only had rolling min/max at w=11. friend's features.py lists rolling_min/max
+at all windows. Adding deviations from local min/max at w=5, 21, 41 too.
+(rmax_w - x) and (x - rmin_w) for w in {5, 21, 41} → +6 point features.
 
-Fix: at inference, P2 gets ref_x = train_x[:SPLIT_FRAC] (first 70%), matching
-what P2 saw during training. P1 is unchanged (full train_x reference, consistent
-with P1 training).
+P1: 74 features (was 68). P2: 81 features (was 75). Otherwise identical to v43.
 
-Run:  uv run python v49_p2_consistent_ref.py
+Run:  uv run python v50_more_minmax.py
 """
 
 from __future__ import annotations
@@ -42,8 +40,8 @@ SMOOTH_W = 5
 SMOOTH_ALPHA = 0.8
 W_SHIFT = 0.30          # blend weight for P2 shift model
 SPLIT_FRAC = 0.70       # fraction of train_x used as "reference" for P2 training
-N_FEATS_P1 = 68
-N_FEATS_P2 = 75         # 68 + 7 shift features
+N_FEATS_P1 = 74          # 68 + 6 extra rolling min/max deviations
+N_FEATS_P2 = 81          # 74 + 7 shift features
 
 
 # ─────────────────────────────────────────────
@@ -179,6 +177,12 @@ def make_features(
     rmin11, rmax11 = _rolling_minmax(x, 11)
     feats.append(rmax11 - x)
     feats.append(x - rmin11)
+
+    # Extended rolling min/max deviations at w=5, 21, 41
+    for w_mm in (5, 21, 41):
+        rmin_w, rmax_w = _rolling_minmax(x, w_mm)
+        feats.append(rmax_w - x)
+        feats.append(x - rmin_w)
 
     static = []
     mt = info.get("metric_type", "Unknown")
@@ -417,11 +421,7 @@ def predict_proba_window(
     prob_p1 = _score_bundle(bundle["p1"], X1)
 
     if bundle["p2"] is not None:
-        # Use only first SPLIT_FRAC of train_x as P2 reference — consistent with P2
-        # training, where ref_x was always train_x[:cut] (first 70%).
-        cut = max(1, int(len(train_x_ref) * SPLIT_FRAC))
-        p2_ref = train_x_ref[:cut]
-        X2 = make_features_shift(test_x, test_ts, p2_ref, info, service, top_services)
+        X2 = make_features_shift(test_x, test_ts, train_x_ref, info, service, top_services)
         prob_p2 = _score_bundle(bundle["p2"], X2)
         return (1.0 - W_SHIFT) * prob_p1 + W_SHIFT * prob_p2
     return prob_p1
@@ -493,10 +493,10 @@ def run_validation(seed: int = 42):
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v49 P2-consistent-ref (CW-LOO)")
+    print_summary_v2(rep, "v50 more-minmax (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v49_p2_consistent_ref_loo")
+    save_report(rep, "v50_more_minmax_loo")
     return rep, ensembles, top_services
 
 
@@ -535,4 +535,4 @@ if __name__ == "__main__":
     ensembles_full = fit_both_ensembles(all_window_dirs(), top_services_full)
     print(f"    full fit {time.time() - t0:.1f}s")
     generate_submission(ensembles_full, top_services_full,
-                        output=Path("submission_v49_p2_consistent_ref.json"))
+                        output=Path("submission_v50_more_minmax.json"))
