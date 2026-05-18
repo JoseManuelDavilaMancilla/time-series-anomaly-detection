@@ -1,12 +1,25 @@
 """
-author v57 — iterated pseudo-labels from v56 (PSEUDO_WEIGHT=0.50, iter 2).
+author v58 — cross-window global context features (NEW METHOD).
 
-Same architecture as v56 (74-feature P1, 81-feature P2, PSEUDO_WEIGHT=0.50)
-but using v56 predictions as pseudo-labels (v56 scored 0.6821 LB — new best).
+Each window is currently scored only against its own training reference.
+This version adds 3 window-level features that capture how globally unusual
+a window is compared to ALL windows of the same metric_type:
+  - global_mean_z: z-score of mean(x) vs metric_type population
+  - global_std_z:  z-score of std(x)  vs metric_type population
+  - global_max_z:  z-score of max(x)  vs metric_type population
 
-PSEUDO_SOURCE: submission_v56_pw50.json (0.6821 LB — current best)
+At training time: population = training windows (train.npy)
+At test inference: population = all 1000 test windows (test.npy)
+Pseudo-labeled test windows: use test.npy stats (consistent with inference)
 
-Run:  uv run python v57_pw50_iter.py
+Hypothesis: globally anomalous windows (high std_z, high max_z) should have
+higher per-point anomaly scores — information the local model ignores.
+
+Base: v57 (PSEUDO_WEIGHT=0.50, v57 pseudo-labels)
+N_FEATS_P1: 74 → 77  (+3 global context)
+N_FEATS_P2: 81 → 84  (+3 global context)
+
+Run:  uv run python v58_global_ctx.py
 """
 
 from __future__ import annotations
@@ -14,7 +27,7 @@ from __future__ import annotations
 import json
 import time
 import warnings
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -39,10 +52,55 @@ SMOOTH_W = 5
 SMOOTH_ALPHA = 0.8
 W_SHIFT = 0.30
 SPLIT_FRAC = 0.70
-N_FEATS_P1 = 74          # 68 base + 6 extra rolling min/max
-N_FEATS_P2 = 81          # 74 + 7 shift features
-PSEUDO_WEIGHT = 0.50    # same as v56; iterating pseudo-labels with stronger model
-PSEUDO_SOURCE = Path("submission_v56_pw50.json")  # 0.6821 LB best
+N_FEATS_P1 = 77          # 74 base + 3 global context
+N_FEATS_P2 = 84          # 81 base + 3 global context
+PSEUDO_WEIGHT = 0.50
+PSEUDO_SOURCE = Path("submission_v57_pw50_iter.json")  # 0.6832 LB best
+
+
+# ─────────────────────────────────────────────
+# Global context: cross-window population stats
+# ─────────────────────────────────────────────
+
+def compute_window_global_stats(window_dirs, data_file: str = "train.npy") -> Dict[Path, Tuple[float, float, float]]:
+    """
+    For each window, compute z-scores of (mean, std, max) relative to all
+    windows of the same metric_type. Returns wdir → (mean_z, std_z, max_z).
+
+    data_file: "train.npy" for training windows, "test.npy" for test windows.
+    """
+    raw: Dict[Path, Tuple[str, float, float, float]] = {}
+    for wdir in window_dirs:
+        info = json.loads((wdir / "info.json").read_text())
+        mt = info.get("metric_type", "Unknown")
+        try:
+            x = np.load(wdir / data_file).astype(np.float64)
+        except FileNotFoundError:
+            x = np.load(wdir / "train.npy").astype(np.float64)
+        raw[wdir] = (mt, float(np.mean(x)), float(np.std(x)), float(np.max(x)))
+
+    by_mt: Dict[str, List] = defaultdict(list)
+    for wdir, (mt, m, s, mx) in raw.items():
+        by_mt[mt].append((wdir, m, s, mx))
+
+    result: Dict[Path, Tuple[float, float, float]] = {}
+    for mt, entries in by_mt.items():
+        wdirs = [e[0] for e in entries]
+        means = np.array([e[1] for e in entries])
+        stds  = np.array([e[2] for e in entries])
+        maxs  = np.array([e[3] for e in entries])
+
+        def _zscore(arr: np.ndarray) -> np.ndarray:
+            mu, sigma = arr.mean(), arr.std()
+            return np.clip((arr - mu) / (sigma + 1e-9), -5.0, 5.0)
+
+        mz = _zscore(means)
+        sz = _zscore(stds)
+        xz = _zscore(maxs)
+        for i, wdir in enumerate(wdirs):
+            result[wdir] = (float(mz[i]), float(sz[i]), float(xz[i]))
+
+    return result
 
 
 # ─────────────────────────────────────────────
@@ -53,9 +111,7 @@ def _rolling_mean_std(x: np.ndarray, w: int) -> Tuple[np.ndarray, np.ndarray]:
     import pandas as pd
     s = pd.Series(x.astype(np.float64))
     r = s.rolling(w, center=True, min_periods=1)
-    mean = r.mean().to_numpy()
-    std = r.std(ddof=0).fillna(0.0).to_numpy()
-    return mean, std
+    return r.mean().to_numpy(), r.std(ddof=0).fillna(0.0).to_numpy()
 
 
 def _rolling_minmax(x: np.ndarray, w: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -71,8 +127,7 @@ def _rolling_median_mad(x: np.ndarray, w: int) -> Tuple[np.ndarray, np.ndarray]:
     med = np.empty(n)
     mad = np.empty(n)
     for i in range(n):
-        start = max(0, i - half)
-        end = min(n, i + half + 1)
+        start, end = max(0, i - half), min(n, i + half + 1)
         seg = x[start:end]
         m = np.median(seg)
         med[i] = m
@@ -121,14 +176,15 @@ def parse_service(case_name: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# Feature builders (identical to v43)
+# Feature builders
 # ─────────────────────────────────────────────
 
 def make_features(
     x: np.ndarray, timestamps: np.ndarray, train_x_ref: np.ndarray,
     info: dict, service: str, top_services: List[str],
+    win_global: Tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> np.ndarray:
-    """68-feature matrix (P1). Identical to v43."""
+    """77-feature matrix (P1) = 74 base + 3 global context z-scores."""
     n = len(x)
     feats = []
 
@@ -184,6 +240,12 @@ def make_features(
         feats.append(rmax_w - x)
         feats.append(x - rmin_w)
 
+    # Global context: z-scores vs metric_type population (NEW)
+    mean_z, std_z, max_z = win_global
+    feats.append(np.full(n, mean_z, dtype=np.float64))
+    feats.append(np.full(n, std_z,  dtype=np.float64))
+    feats.append(np.full(n, max_z,  dtype=np.float64))
+
     static = []
     mt = info.get("metric_type", "Unknown")
     for m in METRIC_TYPES:
@@ -204,21 +266,22 @@ def make_features(
 def make_features_shift(
     x: np.ndarray, timestamps: np.ndarray, ref_x: np.ndarray,
     info: dict, service: str, top_services: List[str],
+    win_global: Tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> np.ndarray:
-    """75-feature matrix (P2) = 68 standard + 7 shift features."""
-    base = make_features(x, timestamps, ref_x, info, service, top_services)
+    """84-feature matrix (P2) = 77 + 7 shift features."""
+    base = make_features(x, timestamps, ref_x, info, service, top_services, win_global)
     n = len(x)
 
     x_med = float(np.median(x))
     x_mad = float(np.median(np.abs(x - x_med))) + 1e-9
     ref_std = float(np.std(ref_x)) + 1e-9
 
-    rank_in_self = _percentile_rank_vs(x, x)
-    self_robust_z = (x - x_med) / (1.4826 * x_mad)
-    above_ref_max = np.maximum(0.0, x - float(np.max(ref_x)))
-    below_ref_min = np.maximum(0.0, float(np.min(ref_x)) - x)
-    mean_shift_bc = np.full(n, float(np.mean(x)) - float(np.mean(ref_x)))
-    std_ratio_bc = np.full(n, float(np.std(x)) / ref_std)
+    rank_in_self    = _percentile_rank_vs(x, x)
+    self_robust_z   = (x - x_med) / (1.4826 * x_mad)
+    above_ref_max   = np.maximum(0.0, x - float(np.max(ref_x)))
+    below_ref_min   = np.maximum(0.0, float(np.min(ref_x)) - x)
+    mean_shift_bc   = np.full(n, float(np.mean(x)) - float(np.mean(ref_x)))
+    std_ratio_bc    = np.full(n, float(np.std(x)) / ref_std)
     median_shift_bc = np.full(n, float(np.median(x)) - float(np.median(ref_x)))
 
     shift_feats = np.column_stack([
@@ -246,19 +309,16 @@ def compute_top_services(window_dirs, k: int = TOP_K_SERVICES) -> List[str]:
 # ─────────────────────────────────────────────
 
 def load_pseudo_labels(path: Path) -> Dict[str, np.ndarray]:
-    """Load binary predictions from a submission JSON as pseudo-labels."""
     data = json.loads(path.read_text())
     return {wid: np.array(v, dtype=np.int64)
             for wid, v in data["predictions"].items()}
 
 
 def build_wid_map(window_dirs) -> Dict[str, Path]:
-    """Map wid (3-digit prefix) to wdir."""
     return {wdir.name.split("_", 1)[0]: wdir for wdir in window_dirs}
 
 
 def _load_test_arrays(wdir: Path, info: dict):
-    """Load test_x and test_ts for a window."""
     test_x = np.load(wdir / "test.npy")
     try:
         test_ts = np.load(wdir / "test_timestamp.npy")
@@ -268,15 +328,14 @@ def _load_test_arrays(wdir: Path, info: dict):
 
 
 # ─────────────────────────────────────────────
-# Training pool builders (with pseudo-labels)
+# Training pool builders
 # ─────────────────────────────────────────────
 
 def _build_pool_p1(window_dirs, top_services, target_mt,
+                   train_global_stats, test_global_stats,
                    pseudo_labels=None, wid_map=None):
-    """P1 pool: full train_x (74 feats) + optional pseudo-labeled test windows."""
     Xs, ys, sample_ws = [], [], []
 
-    # True labeled training windows
     for wdir in window_dirs:
         info = json.loads((wdir / "info.json").read_text())
         if info.get("metric_type") != target_mt:
@@ -293,12 +352,12 @@ def _build_pool_p1(window_dirs, top_services, target_mt,
         except FileNotFoundError:
             train_ts = np.arange(len(train_x), dtype=np.int64) * info.get("intervals", 60)
         service = parse_service(info.get("case_name", ""))
-        feats = make_features(train_x, train_ts, train_x, info, service, top_services)
+        wg = train_global_stats.get(wdir, (0.0, 0.0, 0.0))
+        feats = make_features(train_x, train_ts, train_x, info, service, top_services, wg)
         Xs.append(feats)
         ys.append(train_y)
         sample_ws.append(np.ones(len(train_y), dtype=np.float32))
 
-    # Pseudo-labeled test windows
     if pseudo_labels and wid_map:
         for wid, pseudo_y in pseudo_labels.items():
             if pseudo_y.sum() == 0:
@@ -314,7 +373,8 @@ def _build_pool_p1(window_dirs, top_services, target_mt,
             if len(test_x) != len(pseudo_y):
                 continue
             service = parse_service(info.get("case_name", ""))
-            feats = make_features(test_x, test_ts, train_x, info, service, top_services)
+            wg = test_global_stats.get(wdir, (0.0, 0.0, 0.0))
+            feats = make_features(test_x, test_ts, train_x, info, service, top_services, wg)
             Xs.append(feats)
             ys.append(pseudo_y)
             sample_ws.append(np.full(len(pseudo_y), PSEUDO_WEIGHT, dtype=np.float32))
@@ -325,17 +385,11 @@ def _build_pool_p1(window_dirs, top_services, target_mt,
     return np.vstack(Xs), np.hstack(ys), np.hstack(sample_ws)
 
 
-def _build_pool_p2(window_dirs, top_services, target_mt, split_frac=SPLIT_FRAC,
-                   pseudo_labels=None, wid_map=None):
-    """P2 pool: temporal splits (81 feats) + optional pseudo-labeled test windows.
-
-    For pseudo-labeled test windows: ref_x = train_x[:split_frac] (first 70% of
-    training data). This EXACTLY matches the inference distribution of P2, because
-    at inference P2 sees test_x relative to train_x[:split_frac].
-    """
+def _build_pool_p2(window_dirs, top_services, target_mt,
+                   train_global_stats, test_global_stats,
+                   split_frac=SPLIT_FRAC, pseudo_labels=None, wid_map=None):
     Xs, ys, sample_ws = [], [], []
 
-    # True labeled training windows (temporal split)
     for wdir in window_dirs:
         info = json.loads((wdir / "info.json").read_text())
         if info.get("metric_type") != target_mt:
@@ -362,12 +416,12 @@ def _build_pool_p2(window_dirs, top_services, target_mt, split_frac=SPLIT_FRAC,
             train_ts = np.arange(n, dtype=np.int64) * info.get("intervals", 60)
         pseudo_ts = train_ts[cut:]
         service = parse_service(info.get("case_name", ""))
-        feats = make_features_shift(pseudo_x, pseudo_ts, ref_x, info, service, top_services)
+        wg = train_global_stats.get(wdir, (0.0, 0.0, 0.0))
+        feats = make_features_shift(pseudo_x, pseudo_ts, ref_x, info, service, top_services, wg)
         Xs.append(feats)
         ys.append(pseudo_y_split)
         sample_ws.append(np.ones(len(pseudo_y_split), dtype=np.float32))
 
-    # Pseudo-labeled test windows: ref_x = train_x[:split_frac]
     if pseudo_labels and wid_map:
         for wid, pseudo_y in pseudo_labels.items():
             if pseudo_y.sum() == 0:
@@ -382,12 +436,11 @@ def _build_pool_p2(window_dirs, top_services, target_mt, split_frac=SPLIT_FRAC,
             cut = max(1, int(len(train_x) * split_frac))
             ref_x = train_x[:cut]
             test_x, test_ts = _load_test_arrays(wdir, info)
-            if len(test_x) != len(pseudo_y):
-                continue
-            if len(test_x) < 5:
+            if len(test_x) != len(pseudo_y) or len(test_x) < 5:
                 continue
             service = parse_service(info.get("case_name", ""))
-            feats = make_features_shift(test_x, test_ts, ref_x, info, service, top_services)
+            wg = test_global_stats.get(wdir, (0.0, 0.0, 0.0))
+            feats = make_features_shift(test_x, test_ts, ref_x, info, service, top_services, wg)
             Xs.append(feats)
             ys.append(pseudo_y)
             sample_ws.append(np.full(len(pseudo_y), PSEUDO_WEIGHT, dtype=np.float32))
@@ -404,7 +457,6 @@ def _build_pool_p2(window_dirs, top_services, target_mt, split_frac=SPLIT_FRAC,
 
 def _fit_models(X: np.ndarray, y: np.ndarray, label: str,
                 sample_weight: np.ndarray | None = None) -> dict:
-    """Train 3 RF + 5 HGBT + 1 LR. Supports sample_weight for pseudo-labeling."""
     scaler = StandardScaler().fit(X)
     X_scaled = scaler.transform(X)
 
@@ -439,21 +491,23 @@ def _fit_models(X: np.ndarray, y: np.ndarray, label: str,
 
 
 def fit_both_ensembles(window_dirs, top_services,
+                       train_global_stats, test_global_stats,
                        pseudo_labels=None, wid_map=None) -> Dict[str, dict]:
-    """For each metric_type: fit P1 (74 feats) and P2 (81 feats) bundles."""
     ensembles: Dict[str, dict] = {}
     for mt in METRIC_TYPES:
         print(f"  [{mt}] building pools…", flush=True)
         t0 = time.time()
         X1, y1, w1 = _build_pool_p1(window_dirs, top_services, mt,
+                                     train_global_stats, test_global_stats,
                                      pseudo_labels, wid_map)
         X2, y2, w2 = _build_pool_p2(window_dirs, top_services, mt,
+                                     train_global_stats, test_global_stats,
                                      pseudo_labels=pseudo_labels, wid_map=wid_map)
 
-        n_pseudo_p1 = sum(1 for wid, py in (pseudo_labels or {}).items()
-                          if py.sum() > 0 and wid_map and wid_map.get(wid) is not None
-                          and json.loads((wid_map[wid] / "info.json").read_text()).get("metric_type") == mt)
-        print(f"    P1 X={X1.shape} pos={y1.mean():.3f} pseudo_windows≈{n_pseudo_p1}  "
+        n_pseudo = sum(1 for wid, py in (pseudo_labels or {}).items()
+                       if py.sum() > 0 and wid_map and wid_map.get(wid) is not None
+                       and json.loads((wid_map[wid] / "info.json").read_text()).get("metric_type") == mt)
+        print(f"    P1 X={X1.shape} pos={y1.mean():.3f} pseudo≈{n_pseudo}  "
               f"P2 X={X2.shape} pos={y2.mean() if len(y2) else 0:.3f}  "
               f"build={time.time()-t0:.1f}s")
 
@@ -462,7 +516,6 @@ def fit_both_ensembles(window_dirs, top_services,
             continue
 
         bundle_p1 = _fit_models(X1, y1, "P1", sample_weight=w1)
-
         bundle_p2 = None
         if len(X2) >= 50:
             bundle_p2 = _fit_models(X2, y2, "P2", sample_weight=w2)
@@ -474,30 +527,31 @@ def fit_both_ensembles(window_dirs, top_services,
 
 
 # ─────────────────────────────────────────────
-# Inference (identical to v43)
+# Inference
 # ─────────────────────────────────────────────
 
 def _score_bundle(bundle: dict, X: np.ndarray) -> np.ndarray:
     X_scaled = bundle["scaler"].transform(X)
-    rf_avg = np.mean([clf.predict_proba(X)[:, 1] for clf in bundle["rfs"]], axis=0)
+    rf_avg   = np.mean([clf.predict_proba(X)[:, 1] for clf in bundle["rfs"]], axis=0)
     hgbt_avg = np.mean([clf.predict_proba(X)[:, 1] for clf in bundle["hgbts"]], axis=0)
-    lr_p = bundle["lr"].predict_proba(X_scaled)[:, 1]
+    lr_p     = bundle["lr"].predict_proba(X_scaled)[:, 1]
     return 0.80 * hgbt_avg + 0.10 * rf_avg + 0.10 * lr_p
 
 
 def predict_proba_window(
     test_x, test_ts, train_x_ref, info, service, top_services, ensembles,
+    win_global=(0.0, 0.0, 0.0),
 ) -> np.ndarray:
     mt = info.get("metric_type", "Unknown")
     if mt not in ensembles:
         mt = next(iter(ensembles))
     bundle = ensembles[mt]
 
-    X1 = make_features(test_x, test_ts, train_x_ref, info, service, top_services)
+    X1 = make_features(test_x, test_ts, train_x_ref, info, service, top_services, win_global)
     prob_p1 = _score_bundle(bundle["p1"], X1)
 
     if bundle["p2"] is not None:
-        X2 = make_features_shift(test_x, test_ts, train_x_ref, info, service, top_services)
+        X2 = make_features_shift(test_x, test_ts, train_x_ref, info, service, top_services, win_global)
         prob_p2 = _score_bundle(bundle["p2"], X2)
         return (1.0 - W_SHIFT) * prob_p1 + W_SHIFT * prob_p2
     return prob_p1
@@ -522,7 +576,7 @@ def smooth_centered(p: np.ndarray, w: int = SMOOTH_W) -> np.ndarray:
 
 
 def predict_window(test_x, test_ts, train_x_ref, info, service, top_services,
-                   ensembles) -> np.ndarray:
+                   ensembles, win_global=(0.0, 0.0, 0.0)) -> np.ndarray:
     n = len(test_x)
     ratio = float(info.get("test set anomaly ratio", 0.0))
     k = max(0, min(int(round(n * ratio)), n))
@@ -530,14 +584,13 @@ def predict_window(test_x, test_ts, train_x_ref, info, service, top_services,
         return np.zeros(n, dtype=int)
 
     prob_mean = predict_proba_window(test_x, test_ts, train_x_ref, info, service,
-                                     top_services, ensembles)
+                                     top_services, ensembles, win_global)
     rm = smooth_centered(prob_mean, SMOOTH_W)
     prob_final = (1.0 - SMOOTH_ALPHA) * prob_mean + SMOOTH_ALPHA * rm
 
     order = np.lexsort((np.arange(n), -prob_final))
-    top_idx = order[:k]
     pred = np.zeros(n, dtype=int)
-    pred[top_idx] = 1
+    pred[order[:k]] = 1
     return pred
 
 
@@ -554,9 +607,17 @@ def run_validation(pseudo_labels, wid_map, seed: int = 42):
     print(">>> Computing top-30 services from train_pool…")
     top_services = compute_top_services(train_pool, k=TOP_K_SERVICES)
 
+    print(">>> Computing global context stats…")
+    train_global_stats = compute_window_global_stats(train_pool, data_file="train.npy")
+    test_global_stats  = compute_window_global_stats(all_window_dirs(), data_file="test.npy")
+    print(f"    train_global_stats for {len(train_global_stats)} windows, "
+          f"test_global_stats for {len(test_global_stats)} windows")
+
     print(">>> Fitting P1+P2 ensembles on train_pool + pseudo-labeled test…")
     t0 = time.time()
-    ensembles = fit_both_ensembles(train_pool, top_services, pseudo_labels, wid_map)
+    ensembles = fit_both_ensembles(train_pool, top_services,
+                                   train_global_stats, test_global_stats,
+                                   pseudo_labels, wid_map)
     print(f"    total fit time {time.time() - t0:.1f}s")
 
     def predictor(window):
@@ -565,20 +626,21 @@ def run_validation(pseudo_labels, wid_map, seed: int = 42):
         except FileNotFoundError:
             train_ts = np.arange(len(window.train_x), dtype=np.int64) * window.info.get("intervals", 60)
         service = parse_service(window.info.get("case_name", ""))
+        wg = train_global_stats.get(window.wdir, (0.0, 0.0, 0.0))
         return predict_window(window.train_x, train_ts, window.train_x, window.info,
-                              service, top_services, ensembles)
+                              service, top_services, ensembles, wg)
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v57 pw50 iter (CW-LOO)")
+    print_summary_v2(rep, "v58 global-ctx (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v57_pw50_iter_loo")
-    return rep, ensembles, top_services
+    save_report(rep, "v58_global_ctx_loo")
+    return rep, ensembles, top_services, train_global_stats, test_global_stats
 
 
-def generate_submission(ensembles, top_services,
-                        output: Path = Path("submission_v57_pw50_iter.json")) -> Path:
+def generate_submission(ensembles, top_services, test_global_stats,
+                        output: Path = Path("submission_v58_global_ctx.json")) -> Path:
     print(f"\n>>> Generating predictions on all 1000 test windows…")
     preds: Dict[str, list] = {}
     t0 = time.time()
@@ -589,8 +651,9 @@ def generate_submission(ensembles, top_services,
         except FileNotFoundError:
             test_ts = np.arange(len(w.test_x), dtype=np.int64) * w.info.get("intervals", 60)
         service = parse_service(w.info.get("case_name", ""))
+        wg = test_global_stats.get(wdir, (0.0, 0.0, 0.0))
         pred = predict_window(w.test_x, test_ts, w.train_x, w.info, service,
-                              top_services, ensembles)
+                              top_services, ensembles, wg)
         preds[w.wid] = pred.astype(int).tolist()
         if i % 100 == 0:
             print(f"    {i}/1000 ({time.time() - t0:.0f}s)")
@@ -612,12 +675,15 @@ if __name__ == "__main__":
 
     wid_map = build_wid_map(all_window_dirs())
 
-    rep, ensembles, top_services = run_validation(pseudo_labels, wid_map)
+    rep, ensembles, top_services, train_gs, test_gs = run_validation(pseudo_labels, wid_map)
 
     print("\n>>> Re-training on ALL 1000 windows + pseudo-labels for final submission…")
     t0 = time.time()
-    top_services_full = compute_top_services(all_window_dirs(), k=TOP_K_SERVICES)
-    ensembles_full = fit_both_ensembles(all_window_dirs(), top_services_full,
-                                        pseudo_labels, wid_map)
+    top_services_full   = compute_top_services(all_window_dirs(), k=TOP_K_SERVICES)
+    train_gs_full       = compute_window_global_stats(all_window_dirs(), data_file="train.npy")
+    test_gs_full        = compute_window_global_stats(all_window_dirs(), data_file="test.npy")
+    ensembles_full      = fit_both_ensembles(all_window_dirs(), top_services_full,
+                                              train_gs_full, test_gs_full,
+                                              pseudo_labels, wid_map)
     print(f"    full fit {time.time() - t0:.1f}s")
-    generate_submission(ensembles_full, top_services_full)
+    generate_submission(ensembles_full, top_services_full, test_gs_full)
