@@ -1,17 +1,13 @@
 """
-author v55 — iterated pseudo-labeling round 4 (v54 predictions as pseudo-labels).
+author v56 — higher pseudo-label weight experiment (PSEUDO_WEIGHT=0.50).
 
-Run:  uv run python v55_iter_pseudo3.py
-v52: combines BOTH: 74-feature P1/81-feature P2 + pseudo-labeled test windows.
+Same architecture as v54 (74-feature P1, 81-feature P2, iterated pseudo-labels)
+but PSEUDO_WEIGHT raised from 0.30 to 0.50 to give pseudo-labeled test windows
+more influence during training.
 
-  P1: 74 features (68 base + 6 extra rolling min/max)
-  P2: 81 features (74 + 7 shift)
-  Pseudo-labels: from submission_v50_more_minmax.json (0.6602 LB — best available)
+PSEUDO_SOURCE: submission_v54_iter_pseudo2.json (0.6810 LB — current best)
 
-Sample weight: true labeled points = 1.0, pseudo-labeled points = PSEUDO_WEIGHT.
-Windows where pseudo_y.sum()==0 are skipped (no predicted anomalies).
-
-Run:  uv run python v51_pseudo_label.py
+Run:  uv run python v56_pw50.py
 """
 
 from __future__ import annotations
@@ -46,8 +42,8 @@ W_SHIFT = 0.30
 SPLIT_FRAC = 0.70
 N_FEATS_P1 = 74          # 68 base + 6 extra rolling min/max
 N_FEATS_P2 = 81          # 74 + 7 shift features
-PSEUDO_WEIGHT = 0.30    # sample weight for pseudo-labeled test windows
-PSEUDO_SOURCE = Path("submission_v54_iter_pseudo2.json")
+PSEUDO_WEIGHT = 0.50    # raised from 0.30 → 0.50 (more pseudo-label influence)
+PSEUDO_SOURCE = Path("submission_v54_iter_pseudo2.json")  # 0.6810 LB best
 
 
 # ─────────────────────────────────────────────
@@ -278,7 +274,7 @@ def _load_test_arrays(wdir: Path, info: dict):
 
 def _build_pool_p1(window_dirs, top_services, target_mt,
                    pseudo_labels=None, wid_map=None):
-    """P1 pool: full train_x (68 feats) + optional pseudo-labeled test windows."""
+    """P1 pool: full train_x (74 feats) + optional pseudo-labeled test windows."""
     Xs, ys, sample_ws = [], [], []
 
     # True labeled training windows
@@ -332,7 +328,7 @@ def _build_pool_p1(window_dirs, top_services, target_mt,
 
 def _build_pool_p2(window_dirs, top_services, target_mt, split_frac=SPLIT_FRAC,
                    pseudo_labels=None, wid_map=None):
-    """P2 pool: temporal splits (75 feats) + optional pseudo-labeled test windows.
+    """P2 pool: temporal splits (81 feats) + optional pseudo-labeled test windows.
 
     For pseudo-labeled test windows: ref_x = train_x[:split_frac] (first 70% of
     training data). This EXACTLY matches the inference distribution of P2, because
@@ -445,7 +441,7 @@ def _fit_models(X: np.ndarray, y: np.ndarray, label: str,
 
 def fit_both_ensembles(window_dirs, top_services,
                        pseudo_labels=None, wid_map=None) -> Dict[str, dict]:
-    """For each metric_type: fit P1 (68 feats) and P2 (75 feats) bundles."""
+    """For each metric_type: fit P1 (74 feats) and P2 (81 feats) bundles."""
     ensembles: Dict[str, dict] = {}
     for mt in METRIC_TYPES:
         print(f"  [{mt}] building pools…", flush=True)
@@ -575,15 +571,15 @@ def run_validation(pseudo_labels, wid_map, seed: int = 42):
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v55 iter-pseudo round4 (CW-LOO)")
+    print_summary_v2(rep, "v56 pw50 (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v55_iter_pseudo3_loo")
+    save_report(rep, "v56_pw50_loo")
     return rep, ensembles, top_services
 
 
 def generate_submission(ensembles, top_services,
-                        output: Path = Path("submission_v55_iter_pseudo3.json")) -> Path:
+                        output: Path = Path("submission_v56_pw50.json")) -> Path:
     print(f"\n>>> Generating predictions on all 1000 test windows…")
     preds: Dict[str, list] = {}
     t0 = time.time()
