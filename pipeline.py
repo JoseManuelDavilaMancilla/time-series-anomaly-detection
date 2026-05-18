@@ -1,14 +1,16 @@
 """
-author v39 — v38 fix: include ALL labeled windows in training pool.
+author v40 — fix: centered rolling features (APPROACH.md reveals friend uses
+pandas.Series.rolling(center=True, min_periods=1) for ALL rolling stats).
 
-v38 bug: `if train_y.sum() == 0: continue` skipped 245/1000 windows (24.5%)
-— all pure-normal windows. Friend's spec says "Pool ALL labeled points within
-each type." Including zero-anomaly windows gives models proper exposure to
-normal patterns. v38 scored 0.5586 LB; this is expected to be much better.
+v38/v39 used causal (backwards-only) rolling, which loses the symmetric
+local context that makes anomaly deviations stand out. Centered rolling
+uses both past AND future neighbors — much stronger signal for batch inference.
 
-Everything else identical to v38.
+Only change from v38: _rolling_mean_std, _rolling_median_mad, _rolling_minmax
+now use centered windows. EWMA stays causal (inherently one-sided).
+Zero-label windows still skipped (APPROACH.md confirms this).
 
-Run:  uv run python v39_include_all_windows.py
+Run:  uv run python v40_centered_rolling.py
 """
 
 from __future__ import annotations
@@ -47,39 +49,33 @@ SMOOTH_ALPHA = 0.8
 
 
 def _rolling_mean_std(x: np.ndarray, w: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Causal rolling mean+std via cumsum trick. Edge windows use whatever is available."""
-    n = len(x)
-    s = x.astype(np.float64)
-    csum = np.concatenate([[0.0], np.cumsum(s)])
-    csum2 = np.concatenate([[0.0], np.cumsum(s * s)])
-    idx = np.arange(n)
-    start = np.maximum(0, idx - w + 1)
-    counts = (idx - start + 1).astype(np.float64)
-    sums = csum[idx + 1] - csum[start]
-    sums2 = csum2[idx + 1] - csum2[start]
-    mean = sums / counts
-    var = np.maximum(sums2 / counts - mean * mean, 0.0)
-    std = np.sqrt(var)
+    """Centered rolling mean+std — mirrors friend's pandas.rolling(center=True, min_periods=1)."""
+    import pandas as pd
+    s = pd.Series(x.astype(np.float64))
+    r = s.rolling(w, center=True, min_periods=1)
+    mean = r.mean().to_numpy()
+    std = r.std(ddof=0).fillna(0.0).to_numpy()
     return mean, std
 
 
 def _rolling_minmax(x: np.ndarray, w: int) -> Tuple[np.ndarray, np.ndarray]:
-    n = len(x)
-    rmin = np.empty(n)
-    rmax = np.empty(n)
-    for i in range(n):
-        seg = x[max(0, i - w + 1) : i + 1]
-        rmin[i] = seg.min()
-        rmax[i] = seg.max()
-    return rmin, rmax
+    """Centered rolling min+max — mirrors friend's pandas.rolling(center=True, min_periods=1)."""
+    import pandas as pd
+    s = pd.Series(x.astype(np.float64))
+    r = s.rolling(w, center=True, min_periods=1)
+    return r.min().to_numpy(), r.max().to_numpy()
 
 
 def _rolling_median_mad(x: np.ndarray, w: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Centered rolling median+MAD — half-window on each side, min_periods=1."""
+    half = w // 2
     n = len(x)
     med = np.empty(n)
     mad = np.empty(n)
     for i in range(n):
-        seg = x[max(0, i - w + 1) : i + 1]
+        start = max(0, i - half)
+        end = min(n, i + half + 1)
+        seg = x[start:end]
         m = np.median(seg)
         med[i] = m
         mad[i] = np.median(np.abs(seg - m))
@@ -255,6 +251,8 @@ def _build_pool_for_metric(window_dirs, top_services: List[str], target_mt: str
             train_y = np.load(wdir / "train_label.npy")
         except FileNotFoundError:
             continue
+        if train_y.sum() == 0:
+            continue
         train_x = np.load(wdir / "train.npy")
         try:
             train_ts = np.load(wdir / "train_timestamp.npy")
@@ -422,15 +420,15 @@ def run_validation(seed: int = 42) -> dict:
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v39 include-all-windows (CW-LOO)")
+    print_summary_v2(rep, "v40 centered-rolling (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v39_include_all_loo")
+    save_report(rep, "v40_centered_rolling_loo")
     return rep, models_by_mt, top_services
 
 
 def generate_submission(models_by_mt: Dict[str, dict], top_services: List[str],
-                        output: Path = Path("submission_v39_include_all.json")) -> Path:
+                        output: Path = Path("submission_v40_centered_rolling.json")) -> Path:
     print(f"\n>>> Generating predictions on all 1000 test windows…")
     preds: Dict[str, list] = {}
     t0 = time.time()
