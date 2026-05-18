@@ -1,34 +1,14 @@
 """
-author v38 — faithful replica of friend's 0.6453 LB pipeline.
+author v39 — v38 fix: include ALL labeled windows in training pool.
 
-Key design points (from friend's notes):
+v38 bug: `if train_y.sum() == 0: continue` skipped 245/1000 windows (24.5%)
+— all pure-normal windows. Friend's spec says "Pool ALL labeled points within
+each type." Including zero-anomaly windows gives models proper exposure to
+normal patterns. v38 scored 0.5586 LB; this is expected to be much better.
 
-  1. 68 engineered features per point:
-     - 22 point-level (value, robust/standard z, diffs, rolling mean/std at
-       w=5/11/21, rolling median+MAD at w=11, EWMA + residual + z, percentile
-       rank vs train ECDF, position-in-window, time-of-day, day-of-week)
-     - 7 long-range (rolling stats at w=41 + vol_ratio + max/min deltas)
-     - 39 static window-level (metric_type one-hot×6, top-30 service one-hot,
-       intervals in hours, train/test anomaly ratios)
+Everything else identical to v38.
 
-  2. Per-metric-type training (NOT fully pooled, NOT per-window):
-     - Group labeled windows by metric_type (6 categories).
-     - Pool all labeled training points across windows of that type.
-     - Train 3 RF (seeds 0/1/2) + 5 HGBT (seeds 0..4) + 1 LR per type.
-
-  3. Blend probabilities:
-     prob_mean = 0.80 * HGBT_avg + 0.10 * RF_avg + 0.10 * LR_avg
-
-  4. Smooth (centered):
-     rm = rolling_mean(prob_mean, 5)
-     prob_final = 0.2 * prob_mean + 0.8 * rm
-
-  5. Top-k via plain argpartition. Zero-ratio windows → predict all zeros.
-
-  NO segment growth, NO IF, NO per-window RF, NO CNN. Our complex extras
-  have been hurting LB despite winning validation — this is the lesson.
-
-Run:  uv run python v38_friend_repro.py
+Run:  uv run python v39_include_all_windows.py
 """
 
 from __future__ import annotations
@@ -275,8 +255,6 @@ def _build_pool_for_metric(window_dirs, top_services: List[str], target_mt: str
             train_y = np.load(wdir / "train_label.npy")
         except FileNotFoundError:
             continue
-        if train_y.sum() == 0:
-            continue
         train_x = np.load(wdir / "train.npy")
         try:
             train_ts = np.load(wdir / "train_timestamp.npy")
@@ -444,15 +422,15 @@ def run_validation(seed: int = 42) -> dict:
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v38 friend-repro (CW-LOO)")
+    print_summary_v2(rep, "v39 include-all-windows (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v38_friend_repro_loo")
+    save_report(rep, "v39_include_all_loo")
     return rep, models_by_mt, top_services
 
 
 def generate_submission(models_by_mt: Dict[str, dict], top_services: List[str],
-                        output: Path = Path("submission_friend_repro.json")) -> Path:
+                        output: Path = Path("submission_v39_include_all.json")) -> Path:
     print(f"\n>>> Generating predictions on all 1000 test windows…")
     preds: Dict[str, list] = {}
     t0 = time.time()
