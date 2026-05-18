@@ -1,16 +1,8 @@
 """
-author v40 — fix: centered rolling features (APPROACH.md reveals friend uses
-pandas.Series.rolling(center=True, min_periods=1) for ALL rolling stats).
+author v41 — v40 + smooth=3 (vs smooth=5 in v40). Tests whether tighter
+smoothing improves LB. v40 scored 0.6402 with smooth=5.
 
-v38/v39 used causal (backwards-only) rolling, which loses the symmetric
-local context that makes anomaly deviations stand out. Centered rolling
-uses both past AND future neighbors — much stronger signal for batch inference.
-
-Only change from v38: _rolling_mean_std, _rolling_median_mad, _rolling_minmax
-now use centered windows. EWMA stays causal (inherently one-sided).
-Zero-label windows still skipped (APPROACH.md confirms this).
-
-Run:  uv run python v40_centered_rolling.py
+Run:  uv run python v41_smooth3.py
 """
 
 from __future__ import annotations
@@ -39,7 +31,7 @@ from validation import stratified_holdout, point_f1
 METRIC_TYPES = ("Count", "ErrorCount", "LatencySecond", "QPS",
                 "ResourceUtilizationRate", "SuccessRate")
 TOP_K_SERVICES = 30
-SMOOTH_W = 5
+SMOOTH_W = 3
 SMOOTH_ALPHA = 0.8
 
 
@@ -420,15 +412,15 @@ def run_validation(seed: int = 42) -> dict:
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v40 centered-rolling (CW-LOO)")
+    print_summary_v2(rep, "v41 smooth3 (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v40_centered_rolling_loo")
+    save_report(rep, "v41_smooth3_loo")
     return rep, models_by_mt, top_services
 
 
 def generate_submission(models_by_mt: Dict[str, dict], top_services: List[str],
-                        output: Path = Path("submission_v40_centered_rolling.json")) -> Path:
+                        output: Path = Path("submission_v41_smooth3.json")) -> Path:
     print(f"\n>>> Generating predictions on all 1000 test windows…")
     preds: Dict[str, list] = {}
     t0 = time.time()
