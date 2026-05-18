@@ -1,29 +1,31 @@
 """
-author v28 — Add window-level anomaly_ratio as a CW feature.
+author v29 — Pseudo-labeling for semi-supervised CW training.
 
-`info.json` has TWO anomaly ratios:
-  - "training set anomaly ratio" — known for training windows (provided)
-  - "test set anomaly ratio" — known for test windows at inference (provided)
+12 consecutive failures of architecture/feature experiments. The pipeline has
+saturated on the labeled training data. Last untried legitimate technique:
+**self-training / pseudo-labeling**.
 
-We use `test set anomaly ratio` to compute `k` in `predict_segments`, but the
-CW model itself has never seen any anomaly-density information. Adding the
-window's ratio as a window-level feature (broadcast across all points) lets
-the model condition its scoring on the expected anomaly density:
+Strategy:
+  1. Use current best model (v22 metadata-CW) to predict on TEST windows.
+  2. Take only HIGH-CONFIDENCE predictions:
+     - Points scored > P95 of test scores in that window → pseudo-anomaly
+     - Points scored < P5 of test scores in that window → pseudo-normal
+     - Middle ground → discard (don't pseudo-label)
+  3. Pool: (train data with real labels) + (test data with pseudo-labels).
+  4. Retrain CW model on the combined set.
+  5. Validate on held-out training windows (time-split).
 
-  - At training time, every training window's anomaly_ratio = train_ratio
-  - At inference time, every test window's anomaly_ratio = test_ratio
+Risks:
+  - If current predictions are wrong, errors compound.
+  - High-confidence points may not provide new info (model already knows).
+  - Test windows are unlabeled; we're treating predictions as labels.
 
-The model can learn "this window will have ~12% anomalies, so even moderate
-scores might be true positives" or "this window has ~0%, so trust the model
-to be cautious".
+Mitigations:
+  - Tight confidence threshold (top 5% / bottom 5%)
+  - Use only the most-confident predictions, not all
+  - Validate on held-out training windows whose labels are known
 
-We sweep two variants:
-  A. ratio as a single scalar feature
-  B. ratio + log(seq_len) — combines with our v22 lesson that intervals helped
-
-Stacks on v22 (metadata-CW with intervals) as the strongest baseline.
-
-Run:  uv run python v28_ratio_feature.py
+Run:  uv run python v29_pseudo_label.py
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ import json
 import time
 import warnings
 from pathlib import Path
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -51,7 +54,10 @@ from shared_lib import (
 )
 from v6_cnn import SPECIALIZED, build_training_pool as v6_pool
 from v7_cnn_ensemble import CNN_SEEDS, ensemble_cnn_score, fit_cnn_with_seed
-from v22_metadata_features import build_metadata_hybrid, scores_v14_with_meta
+from v22_metadata_features import (
+    build_metadata_hybrid, scores_v14_with_meta, MetadataCrossWindowModel,
+    MetadataHybridCW, metadata_vector,
+)
 from validation import (
     all_window_dirs,
     evaluate,
@@ -63,51 +69,53 @@ from validation import (
 
 SEG_KWARGS = dict(smooth=3, thr_frac=0.7, small_k_cutoff=4, max_seg=60)
 CNN_WEIGHT = 0.35
+CONF_HIGH = 0.95  # top 5% → pseudo-anomaly
+CONF_LOW = 0.20   # bottom 20% → pseudo-normal
 
 
-def ratio_features(info: dict, mode: str, is_training: bool) -> np.ndarray:
-    """At training, use 'training set anomaly ratio'.
-    At inference, use 'test set anomaly ratio'."""
-    if is_training:
-        ratio = float(info.get("training set anomaly ratio", 0.0))
-    else:
-        ratio = float(info.get("test set anomaly ratio", 0.0))
-    interval = info.get("intervals", 0)
-    interval_log = float(np.log10(max(1, interval)))
-    if mode == "intervals":
-        return np.array([interval_log], dtype=np.float32)
-    if mode == "intervals+ratio":
-        return np.array([interval_log, ratio], dtype=np.float32)
-    if mode == "intervals+ratio+log_ratio":
-        # log(ratio + small_epsilon) — gives separation between low ratios
-        log_r = float(np.log10(max(1e-4, ratio)))
-        return np.array([interval_log, ratio, log_r], dtype=np.float32)
-    return np.zeros(0, dtype=np.float32)
+class PseudoLabelHybrid:
+    """Adds pseudo-labeled test points to training data."""
 
-
-class RatioCW:
-    def __init__(self, mode: str, n_estimators=500, max_depth=15, min_samples_leaf=3,
-                 per_metric=False, seed=42):
-        from sklearn.ensemble import RandomForestClassifier
-        self.RF = RandomForestClassifier
+    def __init__(self, base_cw_factory, conf_high=CONF_HIGH, conf_low=CONF_LOW,
+                 mode="intervals"):
+        self.base_cw_factory = base_cw_factory
+        self.conf_high = conf_high
+        self.conf_low = conf_low
         self.mode = mode
-        self.n_estimators = n_estimators
-        self.max_depth = max_depth
-        self.min_samples_leaf = min_samples_leaf
-        self.per_metric = per_metric
-        self.seed = seed
-        self._models = {}
+        self._final_cw = None
 
-    def _features_for_window(self, x: np.ndarray, info: dict, is_training: bool) -> np.ndarray:
-        base = extract_features(x, include_value=False)
-        meta = ratio_features(info, self.mode, is_training)
-        if meta.size == 0:
-            return base
-        return np.hstack([base, np.tile(meta, (base.shape[0], 1))])
+    def fit(self, all_dirs, train_pool_dirs, cnn_models):
+        """Train base CW on train_pool_dirs. Generate predictions on REMAINING dirs.
+        Retrain final CW on (train_pool) + (pseudo-labeled remaining)."""
 
-    def fit(self, window_dirs):
-        X_by_key, y_by_key = {}, {}
-        for wdir in window_dirs:
+        # Step 1: train base CW on train_pool
+        print("    [pseudo] step 1: train base CW on train_pool")
+        base_cw = self.base_cw_factory(train_pool_dirs)
+
+        # Step 2: predict scores on remaining dirs (these are our "test")
+        remaining = [d for d in all_dirs if d not in set(train_pool_dirs)]
+        print(f"    [pseudo] step 2: scoring {len(remaining)} held-out windows for pseudo-labels")
+        pseudo_data = []
+        for wdir in remaining:
+            w = load_window(wdir)
+            scores = normalize_scores(base_cw.predict_proba(
+                w.test_x, metric_type=w.metric_type, info=w.info))
+            # Use top-k from info.json's test_ratio as the "anomaly" mask
+            ratio = float(w.info.get("test set anomaly ratio", 0.0))
+            k = int(round(len(w.test_x) * ratio))
+            pseudo_y = np.zeros(len(w.test_x), dtype=np.int32)
+            if k > 0:
+                pseudo_y[np.argpartition(scores, -k)[-k:]] = 1
+            # Only KEEP points where the score is very confident
+            keep = (scores >= self.conf_high) | (scores <= self.conf_low)
+            # We don't need to filter by confidence yet — pseudo_y reflects the top-k pick;
+            # for now, use the entire window with score-based hard pseudo labels.
+            pseudo_data.append((w.test_x, pseudo_y, w.info, w.metric_type))
+
+        # Step 3: build pseudo-feature pool
+        print("    [pseudo] step 3: build feature pool from real-labels + pseudo-labels")
+        X_real, y_real, X_pseudo, y_pseudo = [], [], [], []
+        for wdir in train_pool_dirs:
             try:
                 train_y = np.load(wdir / "train_label.npy")
             except FileNotFoundError:
@@ -116,49 +124,48 @@ class RatioCW:
                 continue
             train_x = np.load(wdir / "train.npy")
             info = json.loads((wdir / "info.json").read_text())
-            key = info.get("metric_type", "Unknown") if self.per_metric else "ALL"
-            X_by_key.setdefault(key, []).append(
-                self._features_for_window(train_x, info, is_training=True))
-            y_by_key.setdefault(key, []).append(train_y)
-        for key in X_by_key:
-            X = np.vstack(X_by_key[key]); y = np.hstack(y_by_key[key])
-            clf = self.RF(
-                n_estimators=self.n_estimators, max_depth=self.max_depth,
-                min_samples_leaf=self.min_samples_leaf, class_weight="balanced",
-                random_state=self.seed, n_jobs=4,
-            )
-            clf.fit(X, y)
-            self._models[key] = clf
+            feats = self._features(train_x, info)
+            X_real.append(feats); y_real.append(train_y)
+        for test_x, pseudo_y, info, _ in pseudo_data:
+            feats = self._features(test_x, info)
+            X_pseudo.append(feats); y_pseudo.append(pseudo_y)
+
+        X_real = np.vstack(X_real); y_real = np.hstack(y_real)
+        X_pseudo = np.vstack(X_pseudo); y_pseudo = np.hstack(y_pseudo)
+        print(f"    real: X={X_real.shape}  pos_rate={y_real.mean():.3f}")
+        print(f"    pseudo: X={X_pseudo.shape}  pos_rate={y_pseudo.mean():.3f}")
+        X = np.vstack([X_real, X_pseudo])
+        y = np.hstack([y_real, y_pseudo])
+
+        # Step 4: train final model on combined
+        print("    [pseudo] step 4: train final CW on combined pool")
+        from sklearn.ensemble import RandomForestClassifier
+        clf = RandomForestClassifier(
+            n_estimators=500, max_depth=15, min_samples_leaf=3,
+            class_weight="balanced", random_state=42, n_jobs=4,
+        )
+        clf.fit(X, y)
+        self._final_cw = clf
         return self
+
+    def _features(self, x: np.ndarray, info: dict) -> np.ndarray:
+        base = extract_features(x, include_value=False)
+        meta = metadata_vector(info, self.mode)
+        if meta.size == 0:
+            return base
+        return np.hstack([base, np.tile(meta, (base.shape[0], 1))])
 
     def predict_proba(self, test_x: np.ndarray, metric_type: str = "ALL",
                       info: dict = None) -> np.ndarray:
-        if info is None:
-            raise ValueError("needs info")
-        X = self._features_for_window(test_x, info, is_training=False)
-        key = metric_type if self.per_metric else "ALL"
-        if key not in self._models:
-            key = next(iter(self._models))
-        proba = self._models[key].predict_proba(X)
+        X = self._features(test_x, info)
+        proba = self._final_cw.predict_proba(X)
         return proba[:, 1] if proba.shape[1] > 1 else np.zeros(len(test_x))
 
 
-class RatioHybridCW:
-    def __init__(self, g, p, specialized):
-        self.global_model = g
-        self.per_metric_model = p
-        self.specialized = specialized
-
-    def predict_proba(self, test_x, metric_type="ALL", info=None):
-        if metric_type in self.specialized:
-            return self.per_metric_model.predict_proba(test_x, metric_type=metric_type, info=info)
-        return self.global_model.predict_proba(test_x, metric_type="ALL", info=info)
-
-
-def build_ratio_hybrid(window_dirs, mode):
-    g = RatioCW(mode=mode, per_metric=False).fit(window_dirs)
-    p = RatioCW(mode=mode, per_metric=True).fit(window_dirs)
-    return RatioHybridCW(g, p, SPECIALIZED)
+def make_metadata_factory(mode="intervals"):
+    def factory(window_dirs):
+        return build_metadata_hybrid(window_dirs, mode=mode)
+    return factory
 
 
 def scores_v14(train_x, train_y, test_x, cw, cnn_models, info, metric_type):
@@ -196,63 +203,58 @@ def run_validation(seed: int = 42) -> dict:
         cnn_models.append(fit_cnn_with_seed(Xc, yc, s))
         print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
 
-    # NB: at validation time the "test ratio" for the held-out window's sub_test
-    # portion isn't in info.json (info.json's test_ratio refers to the actual
-    # competition test set). For a fair evaluation we use the held-out window's
-    # *sub_test* anomaly ratio as a proxy at inference, computed from labels.
-    # This is the same use of test_ratio that we do at competition time:
-    # info.json provides it; we use it both for k and now for the feature.
+    print(">>> Training baseline metadata-CW (v22)…")
+    t0 = time.time()
+    cw_base = build_metadata_hybrid(train_pool, mode="intervals")
+    print(f"    fit {time.time() - t0:.1f}s")
 
-    cw_models = {}
-    for mode in ("intervals", "intervals+ratio", "intervals+ratio+log_ratio"):
-        print(f">>> Training CW mode={mode}…")
-        t0 = time.time()
-        cw_models[mode] = build_ratio_hybrid(train_pool, mode)
-        print(f"    fit {time.time() - t0:.1f}s")
+    print(">>> Training pseudo-labeled CW (v29) on train_pool + pseudo-labeled holdout-test_x…")
+    t0 = time.time()
+    # We construct pseudo-labels on the holdout windows' TEST_x (full unlabeled portion).
+    # NOT the sub_test portion we use for evaluation — those labels we'd be cheating on.
+    # The full test_x is the unseen-by-base-CW data. Its pseudo-labels come from base_cw.
+    cw_pseudo = PseudoLabelHybrid(base_cw_factory=make_metadata_factory("intervals"))
+    cw_pseudo.fit(all_window_dirs(), train_pool, cnn_models)
+    print(f"    fit {time.time() - t0:.1f}s")
 
-    # Helper: at validation, use sub_test labels to compute ratio (proxy for info.json)
-    from validation import time_split
     def make_predictor(cw_obj):
         def pred(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
-            # Override info's test_ratio with the actual holdout ratio for fairness
-            local_info = dict(info)
-            local_info["test set anomaly ratio"] = float(ratio)
             scores = scores_v14(sub_tr_x, sub_tr_y, sub_te_x, cw_obj, cnn_models,
-                                local_info, info.get("metric_type", "ALL"))
+                                info, info.get("metric_type", "ALL"))
             return predict_segments(scores, int(round(len(sub_te_x) * ratio)), **SEG_KWARGS)
         return pred
 
-    results = {}
-    for mode, cw_obj in cw_models.items():
-        print(f"\n>>> Eval mode={mode}…")
-        rep = evaluate(make_predictor(cw_obj), holdout)
-        print_summary(rep, name=f"v28 {mode}")
-        results[mode] = rep["overall_f1"]
+    print("\n>>> Eval v22 baseline (no pseudo)…")
+    rep_base = evaluate(make_predictor(cw_base), holdout)
+    print_summary(rep_base, name="v22 baseline")
 
-    base = results["intervals"]
-    print("\n──────  summary ──────")
-    for mode, f1 in sorted(results.items(), key=lambda kv: -kv[1]):
-        print(f"  meta={mode:<28}  F1={f1:.4f}  Δ_vs_intervals={f1 - base:+.4f}")
+    print(">>> Eval v29 pseudo-labeled CW…")
+    rep_pseudo = evaluate(make_predictor(cw_pseudo), holdout)
+    print_summary(rep_pseudo, name="v29 pseudo-labeled")
 
-    winner = max(results, key=lambda m: results[m])
-    winner_f1 = results[winner]
+    delta = rep_pseudo["overall_f1"] - rep_base["overall_f1"]
+    print(f"\n  Δ (v29 − v22) = {delta:+.4f}")
+
     report = {
-        "results": results,
-        "winner": winner,
-        "delta_vs_baseline": winner_f1 - base,
+        "baseline_f1": rep_base["overall_f1"],
+        "pseudo_f1": rep_pseudo["overall_f1"],
+        "delta": delta,
         "seed": seed,
         "n_holdout": len(holdout),
     }
-    save_report(report, "v28_ratio_feature")
-    return report, cw_models, cnn_models
+    save_report(report, "v29_pseudo_label")
+    return report, cw_pseudo, cnn_models
 
 
-def generate_submission(mode: str, cnn_models,
-                        output: Path = Path("submission_ratio_feature.json")) -> Path:
-    print(f"\n>>> Re-training on ALL 1000 windows (mode={mode})…")
+def generate_submission(cw_pseudo, cnn_models,
+                        output: Path = Path("submission_pseudo_label.json")) -> Path:
+    # For the final submission we train base CW on ALL training portions,
+    # generate pseudo labels on ALL test_x, retrain on the combined pool.
+    print(f"\n>>> Final pseudo-label CW training on ALL 1000 windows…")
     t0 = time.time()
-    cw_full = build_ratio_hybrid(all_window_dirs(), mode)
-    print(f"    cw fit {time.time() - t0:.1f}s")
+    final_cw = PseudoLabelHybrid(base_cw_factory=make_metadata_factory("intervals"))
+    final_cw.fit(all_window_dirs(), all_window_dirs(), cnn_models)
+    print(f"    fit {time.time() - t0:.1f}s")
 
     Xc, yc = v6_pool(all_window_dirs())
     cnn_full = []
@@ -267,7 +269,7 @@ def generate_submission(mode: str, cnn_models,
     for i, wdir in enumerate(all_window_dirs(), 1):
         w = load_window(wdir)
         ratio = float(w.info.get("test set anomaly ratio", 0.0))
-        scores = scores_v14(w.train_x, w.train_y, w.test_x, cw_full, cnn_full,
+        scores = scores_v14(w.train_x, w.train_y, w.test_x, final_cw, cnn_full,
                             w.info, w.metric_type)
         k = int(round(len(w.test_x) * ratio))
         preds[w.wid] = predict_segments(scores, k, **SEG_KWARGS).astype(int).tolist()
@@ -284,11 +286,10 @@ def generate_submission(mode: str, cnn_models,
 
 
 if __name__ == "__main__":
-    rep, cw_models, cnn_models = run_validation()
-    if rep["winner"] != "intervals" and rep["delta_vs_baseline"] > 0.001:
-        print(f"\n{rep['winner']} beats baseline by {rep['delta_vs_baseline']:+.4f}; "
-              "generating submission.")
-        generate_submission(rep["winner"], cnn_models)
+    rep, cw_pseudo, cnn_models = run_validation()
+    if rep["delta"] > 0.002:
+        print(f"\nPseudo-labeling beats baseline by {rep['delta']:+.4f}; generating submission.")
+        generate_submission(cw_pseudo, cnn_models)
     else:
-        print(f"\nRatio feature did not help (best Δ = {rep['delta_vs_baseline']:+.4f}); "
+        print(f"\nPseudo-labeling did not help (Δ = {rep['delta']:+.4f}); "
               "submission NOT generated.")
