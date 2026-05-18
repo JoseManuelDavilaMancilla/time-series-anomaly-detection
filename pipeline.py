@@ -1,7 +1,7 @@
 """
-author v54 — iterated pseudo-labeling round 3 (v53 predictions as pseudo-labels).
+author v55 — iterated pseudo-labeling round 4 (v54 predictions as pseudo-labels).
 
-Run:  uv run python v54_iter_pseudo2.py
+Run:  uv run python v55_iter_pseudo3.py
 v52: combines BOTH: 74-feature P1/81-feature P2 + pseudo-labeled test windows.
 
   P1: 74 features (68 base + 6 extra rolling min/max)
@@ -47,7 +47,7 @@ SPLIT_FRAC = 0.70
 N_FEATS_P1 = 74          # 68 base + 6 extra rolling min/max
 N_FEATS_P2 = 81          # 74 + 7 shift features
 PSEUDO_WEIGHT = 0.30    # sample weight for pseudo-labeled test windows
-PSEUDO_SOURCE = Path("submission_v53_iter_pseudo.json")
+PSEUDO_SOURCE = Path("submission_v54_iter_pseudo2.json")
 
 
 # ─────────────────────────────────────────────
@@ -575,15 +575,15 @@ def run_validation(pseudo_labels, wid_map, seed: int = 42):
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v54 iter-pseudo round3 (CW-LOO)")
+    print_summary_v2(rep, "v55 iter-pseudo round4 (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v54_iter_pseudo2_loo")
+    save_report(rep, "v55_iter_pseudo3_loo")
     return rep, ensembles, top_services
 
 
 def generate_submission(ensembles, top_services,
-                        output: Path = Path("submission_v54_iter_pseudo2.json")) -> Path:
+                        output: Path = Path("submission_v55_iter_pseudo3.json")) -> Path:
     print(f"\n>>> Generating predictions on all 1000 test windows…")
     preds: Dict[str, list] = {}
     t0 = time.time()
