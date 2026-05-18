@@ -1,8 +1,8 @@
 """
-author v41 — v40 + smooth=3 (vs smooth=5 in v40). Tests whether tighter
+author v42 — v40 + smooth=7 (vs smooth=5 in v40). Tests whether wider
 smoothing improves LB. v40 scored 0.6402 with smooth=5.
 
-Run:  uv run python v41_smooth3.py
+Run:  uv run python v42_smooth7.py
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from validation import stratified_holdout, point_f1
 METRIC_TYPES = ("Count", "ErrorCount", "LatencySecond", "QPS",
                 "ResourceUtilizationRate", "SuccessRate")
 TOP_K_SERVICES = 30
-SMOOTH_W = 3
+SMOOTH_W = 7
 SMOOTH_ALPHA = 0.8
 
 
@@ -412,15 +412,15 @@ def run_validation(seed: int = 42) -> dict:
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v41 smooth3 (CW-LOO)")
+    print_summary_v2(rep, "v42 smooth7 (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v41_smooth3_loo")
+    save_report(rep, "v42_smooth7_loo")
     return rep, models_by_mt, top_services
 
 
 def generate_submission(models_by_mt: Dict[str, dict], top_services: List[str],
-                        output: Path = Path("submission_v41_smooth3.json")) -> Path:
+                        output: Path = Path("submission_v42_smooth7.json")) -> Path:
     print(f"\n>>> Generating predictions on all 1000 test windows…")
     preds: Dict[str, list] = {}
     t0 = time.time()
