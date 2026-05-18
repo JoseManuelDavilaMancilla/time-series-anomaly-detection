@@ -1,5 +1,5 @@
 """
-author v68 — Seasonal decomposition + AR(1) residual features (prof-style).
+author v69 — Pseudo-label iteration from v68 (0.6905 LB).
 
 A time series professor would grade by: do you detect CONTEXTUAL anomalies —
 values that are normal globally but anomalous given what the seasonal pattern
@@ -74,7 +74,7 @@ N_FFT_BROAD     = 4    # top1/2/3 mag + hf_energy_ratio
 N_FEATS_P1      = 77 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_FFT_BROAD + N_STL_AR_FEATS  # 108
 N_FEATS_P2      = 84 + N_FFT_FEATS + N_TDA_FEATS + N_MP_FEATS + N_ROLL_NEW + N_FFT_BROAD + N_STL_AR_FEATS  # 115
 PSEUDO_WEIGHT   = 0.70
-PSEUDO_SOURCE   = Path("submission_v66_pseudo_iter.json")
+PSEUDO_SOURCE   = Path("submission_v68_stl_ar.json")
 CACHE_DIR       = Path("tda_cache")
 MP_WINDOWS      = [5, 10, 20]
 EXTRA_ROLL_W    = [3, 7, 63]
@@ -665,12 +665,12 @@ def run_validation(pseudo_labels,wid_map):
                               service,top_services,ensembles,wg,_wid(window.wdir))
     print(">>> Cross-window LOO on holdout…")
     rep=cross_window_evaluate(predictor,holdout)
-    print_summary_v2(rep,"v68 STL+AR residuals (CW-LOO)")
+    print_summary_v2(rep,"v69 pseudo-iter from v68 (CW-LOO)")
     return rep
 
 
 def generate_submission(ensembles,top_services,test_gs,
-                        output=Path("submission_v68_stl_ar.json")):
+                        output=Path("submission_v69_iter_v68.json")):
     print(f"\n>>> Generating predictions on 1000 test windows…")
     preds={}; t0=time.time()
     for i,wdir in enumerate(all_window_dirs(),1):
@@ -714,4 +714,4 @@ if __name__ == "__main__":
     ensembles=fit_both_ensembles(all_window_dirs(),top_sv,train_gs,test_gs,pseudo_labels,wid_map)
     print(f"    full fit {time.time()-t0:.1f}s")
     generate_submission(ensembles,top_sv,test_gs)
-    print("\nDone. Submit submission_v68_stl_ar.json")
+    print("\nDone. Submit submission_v69_iter_v68.json")
