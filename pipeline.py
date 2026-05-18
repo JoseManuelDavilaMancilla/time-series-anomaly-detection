@@ -923,6 +923,12 @@ def generate_submission(ensembles,top_services,test_gs,
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--skip-validation", action="store_true", help="Skip holdout validation and train submission directly")
+    parser.add_argument("-o", "--output", type=Path, default=Path("submission_v72_segments.json"))
+    args = parser.parse_args()
+
     print(f"Pseudo-label source: {PSEUDO_SOURCE}")
     print(f"N_FEATS_P1={N_FEATS_P1}  N_FEATS_P2={N_FEATS_P2}")
     print(f"MP windows={MP_WINDOWS}  extra rolling={EXTRA_ROLL_W}  FFT broadcast=4")
@@ -943,7 +949,8 @@ if __name__ == "__main__":
 
     wid_map=build_wid_map(all_window_dirs())
 
-    rep=run_validation(pseudo_labels,wid_map)
+    if not args.skip_validation:
+        rep=run_validation(pseudo_labels,wid_map)
 
     print("\n>>> Re-training on ALL windows for final submission…")
     t0=time.time()
@@ -952,5 +959,5 @@ if __name__ == "__main__":
     test_gs=compute_window_global_stats(all_window_dirs(),"test.npy")
     ensembles=fit_both_ensembles(all_window_dirs(),top_sv,train_gs,test_gs,pseudo_labels,wid_map)
     print(f"    full fit {time.time()-t0:.1f}s")
-    generate_submission(ensembles,top_sv,test_gs,output=Path("submission_v72_segments.json"))
-    print("\nDone. Submit submission_v72_segments.json")
+    generate_submission(ensembles,top_sv,test_gs,output=args.output)
+    print(f"\nDone. Submit {args.output}")
