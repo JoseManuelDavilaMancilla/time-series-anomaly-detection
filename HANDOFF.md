@@ -1,23 +1,25 @@
 # Handoff notes — read this first in the new chat
 
-Last updated: 2026-05-17 (evening)
+Last updated: 2026-05-18 (afternoon)
 
 ## Bottom line
 
 - **Our best LB**: 0.6902 (v66 pseudo_iter, May 17 ~10:21pm) — gap to 0.70 = **0.0098**
-- **First time under 0.01 gap**
-- **v69 is currently running** (pseudo-label iteration of v67, strongest architecture)
+- **v72 generated** (segment selection, no pseudo-labels) — pending LB submission
+- **v72+CNN ensemble generated** (0.7/0.3 blend, 10.36% disagreement) — pending LB submission
 - Remaining slots today: ~1–2
 
 ---
 
-## Today's progression (2026-05-17)
+## Today's progression (2026-05-18)
 
 | Version | Key change | LB |
 |---|---|---|
 | v65 | Matrix profile m=5,10,20 + extra rolling + FFT broadcast | 0.6890 |
 | v67 | 6 MP windows (m=3,5,10,15,20,30) + CUSUM features | 0.6901 |
 | **v66** | **Pseudo-label iteration from v65** | **0.6902 ← best** |
+| v72 | Segment selection (smooth=3, thr_frac=0.7) + 139/146 feats | **pending** |
+| v72+cnn | 0.7×v72 + 0.3×CNN ensemble | **pending** |
 
 ---
 
@@ -129,36 +131,33 @@ Target: **0.73 LB** (gap = 0.0395 from current best 0.6905).
 | **Agent 3 (DL-Builder)** | Build CNN ensemble | **DONE** — `cnn_addon.py` + `generate_cnn_submission_fast.py` created. 1 seed, 5 epochs, ~2.5 min runtime. `submission_cnn_fast.json` generated. | ✅ Ready |
 | **BUILDER** | Fix infra | **DONE** — Added `--skip-validation` flag to `pipeline.py`. Added symlinks for `student_dataset` and `tda_cache`. Graceful fallback when pseudo-labels missing. | ✅ Merged |
 
+### Completed (v72)
+
+| Task | Result | Status |
+|---|---|---|
+| v72 pipeline (`--skip-validation`) | `submission_v72_segments.json` generated (1000 windows, 25583 anomalies) | ✅ Done |
+| v72+CNN ensemble | `submission_v72_cnn_ensemble.json` (0.7/0.3 blend, 10.36% disagreement) | ✅ Done |
+| Validation | **0.3057** (n=100) — comparable to v68 without pseudo-labels | ✅ Done |
+
 ### In Flight
 
 | Task | ETA | Status |
 |---|---|---|
-| v72 pipeline (`--skip-validation`) generating `submission_v72_segments.json` | ~5 min | Running |
+| v73 pseudo-label iteration (`PSEUDO_SOURCE=submission_v72_segments.json`) | ~18 min | Running (background task) |
 
-### Validation Result (v72 without pseudo-labels)
+### Submissions Ready for LB
 
-| Metric | F1 |
+| File | Description |
 |---|---|
-| overall | **0.3057** (n=100) |
-| Count | 0.2513 |
-| ErrorCount | 0.3667 |
-| LatencySecond | 0.3058 |
-| QPS | 0.3230 |
-| ResourceUtilizationRate | 0.2877 |
-| SuccessRate | 0.2953 |
-
-Note: 0.3057 on time-split validation is comparable to v68's expected validation level. Actual LB is typically 2× validation for this pipeline class.
+| `submission_v72_segments.json` | v72 with segment selection, no pseudo-labels |
+| `submission_v72_cnn_ensemble.json` | 0.7×v72 + 0.3×CNN ensemble |
+| `submission_v73_pseudo.json` | v73 pseudo-label iteration of v72 (pending) |
 
 ### Next Steps (Priority)
 
-1. **Wait for v72 submission** → ensemble with `submission_cnn_fast.json` → submit to LB.
-2. **If v72 LB > 0.6905**: use it as pseudo-label source for v73 iteration (`PSEUDO_SOURCE=v72, PSEUDO_WEIGHT=0.70`).
-3. **If v72 LB ≤ 0.6905**: segment selection may not transfer to LB; investigate post-processing.
-4. **CNN weight tuning**: grid-search blend weight between v72 and CNN on validation scores.
-
-**Files ready for ensemble:**
-- `submission_v72_segments.json` (pending)
-- `submission_cnn_fast.json` (ready)
-
-Use: `uv run python ensemble_submissions.py submission_v72_segments.json submission_cnn_fast.json --weights 0.7 0.3 -o submission_v72_cnn_ensemble.json`
+1. **Submit v72 to LB** → get score.
+2. **Submit v72+CNN ensemble to LB** → compare.
+3. **Wait for v73** → submit if v72 LB was good.
+4. **If v73 LB > v72**: iterate again (v74) with v73 as pseudo-label source.
+5. **CNN integration into pipeline.py**: train CNN alongside tree ensemble for end-to-end blending.
 
