@@ -1,13 +1,12 @@
 """
-author v56 — higher pseudo-label weight experiment (PSEUDO_WEIGHT=0.50).
+author v57 — iterated pseudo-labels from v56 (PSEUDO_WEIGHT=0.50, iter 2).
 
-Same architecture as v54 (74-feature P1, 81-feature P2, iterated pseudo-labels)
-but PSEUDO_WEIGHT raised from 0.30 to 0.50 to give pseudo-labeled test windows
-more influence during training.
+Same architecture as v56 (74-feature P1, 81-feature P2, PSEUDO_WEIGHT=0.50)
+but using v56 predictions as pseudo-labels (v56 scored 0.6821 LB — new best).
 
-PSEUDO_SOURCE: submission_v54_iter_pseudo2.json (0.6810 LB — current best)
+PSEUDO_SOURCE: submission_v56_pw50.json (0.6821 LB — current best)
 
-Run:  uv run python v56_pw50.py
+Run:  uv run python v57_pw50_iter.py
 """
 
 from __future__ import annotations
@@ -42,8 +41,8 @@ W_SHIFT = 0.30
 SPLIT_FRAC = 0.70
 N_FEATS_P1 = 74          # 68 base + 6 extra rolling min/max
 N_FEATS_P2 = 81          # 74 + 7 shift features
-PSEUDO_WEIGHT = 0.50    # raised from 0.30 → 0.50 (more pseudo-label influence)
-PSEUDO_SOURCE = Path("submission_v54_iter_pseudo2.json")  # 0.6810 LB best
+PSEUDO_WEIGHT = 0.50    # same as v56; iterating pseudo-labels with stronger model
+PSEUDO_SOURCE = Path("submission_v56_pw50.json")  # 0.6821 LB best
 
 
 # ─────────────────────────────────────────────
@@ -571,15 +570,15 @@ def run_validation(pseudo_labels, wid_map, seed: int = 42):
 
     print(">>> Cross-window LOO evaluation on holdout train_x…")
     rep = cross_window_evaluate(predictor, holdout)
-    print_summary_v2(rep, "v56 pw50 (CW-LOO)")
+    print_summary_v2(rep, "v57 pw50 iter (CW-LOO)")
 
     from validation import save_report
-    save_report(rep, "v56_pw50_loo")
+    save_report(rep, "v57_pw50_iter_loo")
     return rep, ensembles, top_services
 
 
 def generate_submission(ensembles, top_services,
-                        output: Path = Path("submission_v56_pw50.json")) -> Path:
+                        output: Path = Path("submission_v57_pw50_iter.json")) -> Path:
     print(f"\n>>> Generating predictions on all 1000 test windows…")
     preds: Dict[str, list] = {}
     t0 = time.time()
