@@ -714,7 +714,7 @@ def _fit_models(X,y,label,sample_weight=None):
     pos=float(y.mean()); neg_pos_ratio=max(1.,(1-pos)/(pos+1e-9))
     t0=time.time()
     rfs=[RandomForestClassifier(n_estimators=200,max_depth=15,min_samples_leaf=10,
-                                 class_weight="balanced",random_state=s,n_jobs=4).fit(
+                                 class_weight="balanced",random_state=s,n_jobs=1).fit(
                                      X,y,sample_weight=sample_weight) for s in (0,1,2)]
     print(f"    {label} 3-seed RF   {time.time()-t0:.1f}s")
     t0=time.time()
