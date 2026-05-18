@@ -1,17 +1,21 @@
 """
-author v3 — Per-metric_type cross-window models.
+author v4 — CUSUM channel for disjoint / constant_train windows.
 
-Hypothesis: SuccessRate / LatencySecond / ResourceUtilizationRate / ErrorCount /
-QPS / Count are very different distributions. One global RF cannot learn that
-"a SuccessRate anomaly is a tiny dip below 1.0" while "an ErrorCount anomaly
-is a spike above 0". Training 6 separate models — one per metric_type — gives
-each model a coherent target. Average ~125 anomalous windows per type, plenty
-of data to fit on.
+Hypothesis: for windows where the test series sits at a level the training
+never visited (disjoint) or where training is flat (constant_train), the
+real anomaly signal is "the level shifted persistently", not "this single
+point is far from its neighbors". The online rolling-z and global-distance
+scorers we already use are both pointwise; they miss sustained shifts.
 
-We try both RF and LGBM backends to pick the winner. Segment selection from v1
-is applied to both.
+CUSUM accumulates departures from train mean/std, so a sustained level
+change drives the CUSUM statistic up monotonically and lights up the
+entire shifted region.
 
-Run:  uv run python v3_per_metric.py
+Builds on top of v3's hybrid cross-window + segment selection. Activates
+CUSUM only for the two categories above (where it should help) so we don't
+disturb the other 730 windows that already work.
+
+Run:  uv run python v4_cusum.py
 """
 
 from __future__ import annotations
@@ -23,7 +27,6 @@ from pathlib import Path
 
 import numpy as np
 
-# Silence the harmless feature-name warning from sklearn when feeding numpy arrays to LGBM.
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
 from shared_lib import (
@@ -42,6 +45,16 @@ from validation import (
 )
 
 SEG_KWARGS = dict(smooth=5, thr_frac=0.6, small_k_cutoff=4, max_seg=80)
+SPECIALIZED = frozenset({"ErrorCount", "ResourceUtilizationRate", "SuccessRate"})
+
+
+def build_hybrid(window_dirs):
+    g = CrossWindowModel(backend="rf", per_metric=False,
+                         n_estimators=200, max_depth=12).fit(window_dirs)
+    p = CrossWindowModel(backend="rf", per_metric=True,
+                         n_estimators=200, max_depth=12).fit(window_dirs)
+    return HybridCrossWindowModel(global_model=g, per_metric_model=p,
+                                  specialized_types=SPECIALIZED)
 
 
 def run_validation(seed: int = 42) -> dict:
@@ -49,138 +62,63 @@ def run_validation(seed: int = 42) -> dict:
     train_pool, holdout = stratified_holdout(all_window_dirs(), frac=0.10, seed=seed)
     print(f"    train_pool={len(train_pool)}  holdout={len(holdout)}")
 
-    print(">>> Training RF (global) — control…")
+    print(">>> Training hybrid cross-window…")
     t0 = time.time()
-    cw_rf_global = CrossWindowModel(backend="rf", per_metric=False,
-                                    n_estimators=200, max_depth=12).fit(train_pool)
-    print(f"    rf global fit {time.time() - t0:.1f}s")
+    cw = build_hybrid(train_pool)
+    print(f"    fit {time.time() - t0:.1f}s")
 
-    print(">>> Training RF (per metric_type)…")
-    t0 = time.time()
-    cw_rf_per = CrossWindowModel(backend="rf", per_metric=True,
-                                 n_estimators=200, max_depth=12).fit(train_pool)
-    print(f"    rf per-metric fit {time.time() - t0:.1f}s "
-          f"({len(cw_rf_per._models)} sub-models: {list(cw_rf_per._models)})")
-
-    print(">>> Training LGBM (per metric_type)…")
-    t0 = time.time()
-    cw_lgbm_per = CrossWindowModel(backend="lgbm", per_metric=True,
-                                   n_estimators=400, max_depth=8,
-                                   min_samples_leaf=10).fit(train_pool)
-    print(f"    lgbm per-metric fit {time.time() - t0:.1f}s")
-
-    def predictor_for(cw):
+    def make_predictor(use_cusum: bool):
         def pred(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
-            scores, _ = v8_style_scores(sub_tr_x, sub_tr_y, sub_te_x, cw,
-                                        metric_type=info.get("metric_type", "ALL"))
+            scores, _ = v8_style_scores(
+                sub_tr_x, sub_tr_y, sub_te_x, cw,
+                metric_type=info.get("metric_type", "ALL"),
+                use_cusum=use_cusum,
+            )
             k = int(round(len(sub_te_x) * ratio))
             return predict_segments(scores, k, **SEG_KWARGS)
         return pred
 
-    print(">>> Eval: RF global + segments (v1 baseline)…")
-    rep_global = evaluate(predictor_for(cw_rf_global), holdout)
-    print_summary(rep_global, name="RF global + segments")
+    print(">>> Eval: hybrid + segments  (v3 baseline)…")
+    rep_v3 = evaluate(make_predictor(use_cusum=False), holdout)
+    print_summary(rep_v3, name="v3 hybrid + segments")
 
-    print(">>> Eval: RF per-metric + segments…")
-    rep_rf_per = evaluate(predictor_for(cw_rf_per), holdout)
-    print_summary(rep_rf_per, name="RF per-metric + segments")
+    print(">>> Eval: hybrid + segments + CUSUM (v4)…")
+    rep_v4 = evaluate(make_predictor(use_cusum=True), holdout)
+    print_summary(rep_v4, name="v4 hybrid + segments + CUSUM")
 
-    print(">>> Eval: LGBM per-metric + segments…")
-    rep_lgbm_per = evaluate(predictor_for(cw_lgbm_per), holdout)
-    print_summary(rep_lgbm_per, name="LGBM per-metric + segments")
-
-    # ── Hybrid: route to per-metric only for the metric_types where it actually wins.
-    # Threshold = +0.005 to ignore noise-level wins.
-    specialized = frozenset(
-        mt for mt in rep_rf_per["by_metric_type"]
-        if rep_rf_per["by_metric_type"][mt]["mean_f1"]
-           - rep_global["by_metric_type"].get(mt, {"mean_f1": 0})["mean_f1"]
-           > 0.005
-    )
-    print(f"\n>>> Hybrid specialization set (per-metric > global by >0.005): {sorted(specialized)}")
-    cw_hybrid = HybridCrossWindowModel(
-        global_model=cw_rf_global,
-        per_metric_model=cw_rf_per,
-        specialized_types=specialized,
-    )
-    print(">>> Eval: Hybrid (per-metric for winners, global otherwise) + segments…")
-    rep_hybrid = evaluate(predictor_for(cw_hybrid), holdout)
-    print_summary(rep_hybrid, name="Hybrid + segments")
-
-    print(f"\n    Δ (RF per-metric − RF global)   = {rep_rf_per['overall_f1'] - rep_global['overall_f1']:+.4f}")
-    print(f"    Δ (LGBM per-metric − RF global) = {rep_lgbm_per['overall_f1'] - rep_global['overall_f1']:+.4f}")
-    print(f"    Δ (Hybrid − RF global)          = {rep_hybrid['overall_f1'] - rep_global['overall_f1']:+.4f}")
-
-    # Pick the winner
-    candidates = [
-        ("rf_global", rep_global["overall_f1"], "rf", False, None),
-        ("rf_per_metric", rep_rf_per["overall_f1"], "rf", True, None),
-        ("lgbm_per_metric", rep_lgbm_per["overall_f1"], "lgbm", True, None),
-        ("hybrid", rep_hybrid["overall_f1"], "rf", "hybrid", specialized),
-    ]
-    candidates.sort(key=lambda x: -x[1])
-    winner_name, winner_f1, winner_backend, winner_mode, winner_special = candidates[0]
-    print(f"\n    Winner: {winner_name} (F1={winner_f1:.4f})")
+    delta = rep_v4["overall_f1"] - rep_v3["overall_f1"]
+    print(f"    Δ (v4 − v3) = {delta:+.4f}")
 
     report = {
-        "rf_global": rep_global,
-        "rf_per_metric": rep_rf_per,
-        "lgbm_per_metric": rep_lgbm_per,
-        "hybrid": rep_hybrid,
-        "winner": winner_name,
-        "winner_config": {
-            "backend": winner_backend,
-            "mode": winner_mode,
-            "specialized_types": sorted(winner_special) if winner_special else None,
-        },
+        "v3_hybrid": rep_v3,
+        "v4_with_cusum": rep_v4,
+        "delta_v4_vs_v3": delta,
         "seed": seed,
         "n_holdout": len(holdout),
     }
-    save_report(report, "v3_per_metric")
+    save_report(report, "v4_cusum")
     return report
 
 
-def _train_full(backend: str, mode):
-    """mode is True/False for plain per-metric, or 'hybrid' for the routed model."""
-    if mode == "hybrid":
-        print(">>> Training full data: RF global + RF per-metric (for hybrid)…")
-        t0 = time.time()
-        g = CrossWindowModel(backend="rf", per_metric=False,
-                             n_estimators=200, max_depth=12).fit(all_window_dirs())
-        p = CrossWindowModel(backend="rf", per_metric=True,
-                             n_estimators=200, max_depth=12).fit(all_window_dirs())
-        print(f"    fit time {time.time() - t0:.1f}s")
-        return g, p
-    print(f"\n>>> Training cross-window {backend} (per_metric={mode}) on ALL 1000 windows…")
+def generate_submission(output: Path = Path("submission_cusum.json")) -> Path:
+    print("\n>>> Training hybrid on ALL 1000 windows…")
     t0 = time.time()
-    cw = CrossWindowModel(
-        backend=backend, per_metric=bool(mode),
-        n_estimators=400 if backend == "lgbm" else 200,
-        max_depth=8 if backend == "lgbm" else 12,
-        min_samples_leaf=10 if backend == "lgbm" else 3,
-    ).fit(all_window_dirs())
-    print(f"    fit time {time.time() - t0:.1f}s  models: {list(cw._models)}")
-    return cw
+    cw = build_hybrid(all_window_dirs())
+    print(f"    fit {time.time() - t0:.1f}s")
 
-
-def generate_submission(backend: str, mode, specialized_types,
-                        output: Path = Path("submission_per_metric.json")) -> Path:
-    trained = _train_full(backend, mode)
-    if mode == "hybrid":
-        g, p = trained
-        cw = HybridCrossWindowModel(global_model=g, per_metric_model=p,
-                                    specialized_types=frozenset(specialized_types or []))
-    else:
-        cw = trained
-
-    print(">>> Generating predictions…")
+    print(">>> Generating predictions with CUSUM…")
     preds: dict[str, list[int]] = {}
+    cusum_categories = {"disjoint": 0, "constant_train": 0}
     t0 = time.time()
     for i, wdir in enumerate(all_window_dirs(), 1):
         w = load_window(wdir)
         test_ratio = float(w.info.get("test set anomaly ratio", 0.0))
-        scores, _ = v8_style_scores(w.train_x, w.train_y, w.test_x, cw,
-                                    metric_type=w.metric_type)
+        scores, cat = v8_style_scores(
+            w.train_x, w.train_y, w.test_x, cw,
+            metric_type=w.metric_type, use_cusum=True,
+        )
+        if cat in cusum_categories:
+            cusum_categories[cat] += 1
         k = int(round(len(w.test_x) * test_ratio))
         preds[w.wid] = predict_segments(scores, k, **SEG_KWARGS).astype(int).tolist()
         if i % 100 == 0:
@@ -192,16 +130,14 @@ def generate_submission(backend: str, mode, specialized_types,
         encoding="utf-8",
     )
     print(f">>> Wrote {output}")
+    print(f">>> CUSUM-affected windows: {cusum_categories}")
     return output
 
 
 if __name__ == "__main__":
     rep = run_validation()
-    cfg = rep["winner_config"]
-    if rep["winner"] == "rf_global":
-        print("\n!! No variant beat the global model; submission NOT generated.")
+    if rep["delta_v4_vs_v3"] >= -0.003:
+        print("\nCUSUM ≥ no-CUSUM (within noise). Generating submission.")
+        generate_submission()
     else:
-        out_name = "submission_per_metric.json" if cfg["mode"] != "hybrid" else "submission_hybrid_per_metric.json"
-        print(f"\nGenerating {out_name} with {rep['winner']}…")
-        generate_submission(cfg["backend"], cfg["mode"], cfg.get("specialized_types"),
-                            output=Path(out_name))
+        print(f"\n!! CUSUM hurt by {-rep['delta_v4_vs_v3']:.4f}; submission NOT generated.")
