@@ -1,45 +1,43 @@
 """
-author v26 — Transformer encoder anomaly scorer.
+author v27 — Spectral / wavelet features as a new CW channel.
 
-We need a fundamentally different model class than CNN. Attention over the
-entire context lets the model learn position-aware long-range dependencies
-that 1D conv (limited to ~32-pt receptive field at our settings) cannot.
+Hypothesis: existing features (lags, rolling stats, EMA) are all *temporal-
+domain* statistics. Anomalies often manifest as frequency-domain changes:
+loss of periodicity, new high-frequency content, energy redistribution.
+We've never given the CW model access to spectral features.
 
-Architecture:
-  - Input: 64-pt z-scored context per target point
-  - Linear projection to d_model=64
-  - Sinusoidal position embedding
-  - 3 TransformerEncoder layers (n_heads=4, dim_feedforward=128, dropout=0.1)
-  - Mean-pool across time
-  - Linear head → sigmoid → anomaly probability
+For each point, extract:
+  - FFT magnitudes at low/mid/high frequency bins (4 features)
+  - Spectral entropy of the local 32-pt window
+  - Wavelet detail coefficients at 3 scales (3 features)
+  - Local zero-crossing rate (1 feature)
 
-3-seed ensemble (variance reduction is critical for transformers on small data).
-Replaces the CNN channel in the v22 pipeline (metadata CW + IF + segments).
+These become per-point features alongside the existing time-domain ones,
+boosting the CW feature dimension from 27 → 36. The model can then learn
+"high-frequency content drops in this anomaly" or "this is the only point
+with non-zero wavelet detail at scale 2".
 
-If this works, we may try Transformer + CNN dual-channel for further gain.
-
-Run:  uv run python v26_transformer.py
+Run:  uv run python v27_spectral_features.py
 """
 
 from __future__ import annotations
 
 import json
-import math
 import time
 import warnings
 from pathlib import Path
-from typing import List
+from typing import Dict
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
 from shared_lib import (
+    CrossWindowModel,
+    HybridCrossWindowModel,
     categorize_window,
+    extract_features,
     global_distance_score,
     isolation_forest_test,
     normalize_scores,
@@ -47,12 +45,11 @@ from shared_lib import (
     per_window_rf_score,
     predict_segments,
 )
-from v6_cnn import (
-    DEVICE, BATCH, LR, WEIGHT_POS, SUBSAMPLE_NEG, SEED, SPECIALIZED,
-    _zscore_series,
+from v6_cnn import SPECIALIZED, build_training_pool as v6_pool
+from v7_cnn_ensemble import CNN_SEEDS, ensemble_cnn_score, fit_cnn_with_seed
+from v22_metadata_features import (
+    MetadataCrossWindowModel, MetadataHybridCW, INTERVALS, metadata_vector,
 )
-from v7_cnn_ensemble import CNN_SEEDS
-from v22_metadata_features import build_metadata_hybrid
 from validation import (
     all_window_dirs,
     evaluate,
@@ -62,142 +59,146 @@ from validation import (
     stratified_holdout,
 )
 
-CONTEXT = 64
-D_MODEL = 64
-N_HEADS = 4
-N_LAYERS = 3
-FF_DIM = 128
-DROPOUT = 0.1
-TF_EPOCHS = 6
 SEG_KWARGS = dict(smooth=3, thr_frac=0.7, small_k_cutoff=4, max_seg=60)
-TF_WEIGHT = 0.35
+CNN_WEIGHT = 0.35
+WIN = 32  # spectral window size
 
 
-def build_contexts(series: np.ndarray, context: int = CONTEXT) -> np.ndarray:
-    s = _zscore_series(series)
-    half = context // 2
-    padded = np.pad(s, (half, half), mode="constant", constant_values=0.0)
-    n = len(s)
-    out = np.empty((n, context), dtype=np.float32)
+def spectral_features(series: np.ndarray, win: int = WIN) -> np.ndarray:
+    """Per-point spectral features computed over a centered window of size `win`."""
+    n = len(series)
+    half = win // 2
+    s = series.astype(np.float64)
+    padded = np.concatenate([np.full(half, s[0]), s, np.full(half, s[-1])])
+
+    out = np.zeros((n, 8), dtype=np.float32)
     for i in range(n):
-        out[i] = padded[i : i + context]
+        w = padded[i : i + win]
+        w = w - w.mean()
+        # FFT magnitudes
+        fft_mag = np.abs(np.fft.rfft(w))  # (win//2 + 1,)
+        # Normalize so they're scale-invariant
+        total = fft_mag.sum() + 1e-9
+        fft_norm = fft_mag / total
+        # Low, mid, high band energy fractions
+        n_bins = len(fft_mag)
+        b1 = n_bins // 3
+        b2 = 2 * n_bins // 3
+        out[i, 0] = float(fft_norm[:b1].sum())
+        out[i, 1] = float(fft_norm[b1:b2].sum())
+        out[i, 2] = float(fft_norm[b2:].sum())
+        # Dominant frequency index (normalized)
+        out[i, 3] = float(np.argmax(fft_mag) / max(1, n_bins - 1))
+        # Spectral entropy
+        p = fft_norm[fft_norm > 0]
+        out[i, 4] = float(-(p * np.log(p)).sum()) if len(p) else 0.0
+        # Zero-crossing rate
+        out[i, 5] = float(((w[:-1] * w[1:]) < 0).sum() / max(1, len(w) - 1))
+        # Total energy (relative to window size)
+        out[i, 6] = float((w * w).sum() / win)
+        # Variance ratio: first half vs second half
+        h1, h2 = w[:half], w[half:]
+        out[i, 7] = float((h1.var() + 1e-9) / (h2.var() + 1e-9))
     return out
 
 
-def build_training_pool(window_dirs, context: int = CONTEXT
-                        ) -> tuple[np.ndarray, np.ndarray]:
-    Xs, ys = [], []
-    for wdir in window_dirs:
-        train_y = np.load(wdir / "train_label.npy")
-        if train_y.sum() == 0:
-            continue
-        train_x = np.load(wdir / "train.npy")
-        if len(train_x) < context // 2 + 4:
-            continue
-        Xs.append(build_contexts(train_x, context))
-        ys.append(train_y.astype(np.float32))
-    X = np.vstack(Xs); y = np.concatenate(ys)
-    if 0 < SUBSAMPLE_NEG < 1.0:
-        rng = np.random.default_rng(SEED)
-        neg_idx = np.where(y == 0)[0]
-        keep_n = int(len(neg_idx) * SUBSAMPLE_NEG)
-        keep_idx = rng.choice(neg_idx, size=keep_n, replace=False)
-        all_idx = np.concatenate([np.where(y == 1)[0], keep_idx])
-        rng.shuffle(all_idx)
-        X = X[all_idx]; y = y[all_idx]
-    return X, y
+class SpectralMetadataCW:
+    """CW model with metadata features (intervals) + spectral features."""
+
+    def __init__(self, n_estimators=500, max_depth=15, min_samples_leaf=3,
+                 per_metric=False, seed=42):
+        from sklearn.ensemble import RandomForestClassifier
+        self.RF = RandomForestClassifier
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.min_samples_leaf = min_samples_leaf
+        self.per_metric = per_metric
+        self.seed = seed
+        self._models = {}
+
+    def _features_for_window(self, train_x, info):
+        base = extract_features(train_x, include_value=False)
+        meta = metadata_vector(info, mode="intervals")
+        spec = spectral_features(train_x)
+        broadcast_meta = np.tile(meta, (base.shape[0], 1))
+        return np.hstack([base, broadcast_meta, spec])
+
+    def fit(self, window_dirs):
+        X_by_key, y_by_key = {}, {}
+        for wdir in window_dirs:
+            try:
+                train_y = np.load(wdir / "train_label.npy")
+            except FileNotFoundError:
+                continue
+            if train_y.sum() == 0:
+                continue
+            train_x = np.load(wdir / "train.npy")
+            info = json.loads((wdir / "info.json").read_text())
+            key = info.get("metric_type", "Unknown") if self.per_metric else "ALL"
+            X_by_key.setdefault(key, []).append(self._features_for_window(train_x, info))
+            y_by_key.setdefault(key, []).append(train_y)
+
+        for key in X_by_key:
+            X = np.vstack(X_by_key[key])
+            y = np.hstack(y_by_key[key])
+            clf = self.RF(
+                n_estimators=self.n_estimators, max_depth=self.max_depth,
+                min_samples_leaf=self.min_samples_leaf, class_weight="balanced",
+                random_state=self.seed, n_jobs=4,
+            )
+            clf.fit(X, y)
+            self._models[key] = clf
+        return self
+
+    def predict_proba(self, test_x, metric_type="ALL", info=None):
+        if info is None:
+            raise ValueError("needs info")
+        X = self._features_for_window(test_x, info)
+        key = metric_type if self.per_metric else "ALL"
+        if key not in self._models:
+            key = next(iter(self._models))
+        proba = self._models[key].predict_proba(X)
+        return proba[:, 1] if proba.shape[1] > 1 else np.zeros(len(test_x))
 
 
-class TinyTransformer(nn.Module):
-    def __init__(self, context: int = CONTEXT, d_model: int = D_MODEL):
-        super().__init__()
-        self.context = context
-        self.proj = nn.Linear(1, d_model)
-        # Sinusoidal position embedding (no learnable params, more stable on small data)
-        pe = torch.zeros(context, d_model)
-        position = torch.arange(0, context, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) *
-                             -(math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0))  # (1, context, d_model)
+class SpectralHybridCW:
+    def __init__(self, g, p, specialized):
+        self.global_model = g
+        self.per_metric_model = p
+        self.specialized = specialized
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=N_HEADS, dim_feedforward=FF_DIM,
-            dropout=DROPOUT, batch_first=True, activation="gelu",
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=N_LAYERS)
-        # Predict the center position by using its encoded representation
-        self.head = nn.Linear(d_model, 1)
-
-    def forward(self, x):
-        # x: (B, context) → (B, context, d_model)
-        x = self.proj(x.unsqueeze(-1)) + self.pe
-        z = self.encoder(x)
-        # Center position
-        center = z[:, self.context // 2, :]
-        return self.head(center).squeeze(-1)
+    def predict_proba(self, test_x, metric_type="ALL", info=None):
+        if metric_type in self.specialized:
+            return self.per_metric_model.predict_proba(test_x, metric_type=metric_type,
+                                                       info=info)
+        return self.global_model.predict_proba(test_x, metric_type="ALL", info=info)
 
 
-def fit_tf(X: np.ndarray, y: np.ndarray, seed: int) -> TinyTransformer:
-    import sys
-    torch.manual_seed(seed); np.random.seed(seed)
-    model = TinyTransformer().to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
-    pos_weight = torch.tensor([WEIGHT_POS], dtype=torch.float32, device=DEVICE)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-    ds = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
-    dl = DataLoader(ds, batch_size=BATCH, shuffle=True, num_workers=0)
-
-    for epoch in range(TF_EPOCHS):
-        model.train()
-        running, n_batches = 0.0, 0
-        t0 = time.time()
-        for xb, yb in dl:
-            xb = xb.to(DEVICE); yb = yb.to(DEVICE)
-            opt.zero_grad()
-            loss = loss_fn(model(xb), yb)
-            loss.backward(); opt.step()
-            running += loss.item(); n_batches += 1
-        print(f"      TF epoch {epoch + 1}/{TF_EPOCHS}  loss={running / n_batches:.4f}  "
-              f"({time.time() - t0:.1f}s)", flush=True)
-        sys.stdout.flush()
-    return model
+def build_spectral_hybrid(window_dirs):
+    g = SpectralMetadataCW(per_metric=False).fit(window_dirs)
+    p = SpectralMetadataCW(per_metric=True).fit(window_dirs)
+    return SpectralHybridCW(g, p, SPECIALIZED)
 
 
-def tf_score(model: TinyTransformer, test_x: np.ndarray) -> np.ndarray:
-    model.eval()
-    X = build_contexts(test_x)
-    with torch.no_grad():
-        xb = torch.from_numpy(X).to(DEVICE)
-        logits = model(xb)
-        return torch.sigmoid(logits).cpu().numpy()
-
-
-def tf_ensemble_score(models: List, test_x: np.ndarray) -> np.ndarray:
-    return np.mean([tf_score(m, test_x) for m in models], axis=0)
-
-
-def scores_with_tf(train_x, train_y, test_x, cw, tf_models, info, metric_type):
+def scores_with_meta(train_x, train_y, test_x, cw, cnn_models, info, metric_type):
     category = categorize_window(train_x, test_x)
     cw_s = normalize_scores(cw.predict_proba(test_x, metric_type=metric_type, info=info))
-    tf_s = normalize_scores(tf_ensemble_score(tf_models, test_x))
+    cnn_s = normalize_scores(ensemble_cnn_score(cnn_models, test_x))
 
     if category == "constant_train":
         if_s = normalize_scores(isolation_forest_test(test_x, train_y))
-        return (0.50 - TF_WEIGHT) * cw_s + 0.50 * if_s + TF_WEIGHT * tf_s
+        return (0.50 - CNN_WEIGHT) * cw_s + 0.50 * if_s + CNN_WEIGHT * cnn_s
     if category == "disjoint":
         g_s = normalize_scores(global_distance_score(train_x, test_x))
         if_s = normalize_scores(isolation_forest_test(test_x, train_y))
-        return 0.35 * cw_s + 0.30 * g_s + (0.35 - TF_WEIGHT) * if_s + TF_WEIGHT * tf_s
+        return 0.35 * cw_s + 0.30 * g_s + (0.35 - CNN_WEIGHT) * if_s + CNN_WEIGHT * cnn_s
     if category == "partial_overlap":
         pw = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
         local = normalize_scores(online_ensemble(test_x, window=15))
-        return 0.35 * cw_s + 0.35 * pw + (0.30 - TF_WEIGHT) * local + TF_WEIGHT * tf_s
+        return 0.35 * cw_s + 0.35 * pw + (0.30 - CNN_WEIGHT) * local + CNN_WEIGHT * cnn_s
     if category == "test_within_train":
         pw = normalize_scores(per_window_rf_score(train_x, train_y, test_x))
-        return (0.50 - TF_WEIGHT) * cw_s + 0.50 * pw + TF_WEIGHT * tf_s
+        return (0.50 - CNN_WEIGHT) * cw_s + 0.50 * pw + CNN_WEIGHT * cnn_s
     return np.zeros(len(test_x))
 
 
@@ -206,28 +207,18 @@ def run_validation(seed: int = 42) -> dict:
     train_pool, holdout = stratified_holdout(all_window_dirs(), frac=0.10, seed=seed)
     print(f"    train_pool={len(train_pool)}  holdout={len(holdout)}")
 
-    print(">>> Training metadata-CW (v22 baseline)…")
+    print(">>> Training metadata-CW baseline (v22)…")
     t0 = time.time()
-    cw = build_metadata_hybrid(train_pool, mode="intervals")
-    print(f"    cw fit {time.time() - t0:.1f}s")
+    from v22_metadata_features import build_metadata_hybrid
+    cw_v22 = build_metadata_hybrid(train_pool, mode="intervals")
+    print(f"    cw v22 fit {time.time() - t0:.1f}s")
 
-    print(">>> Building TF training pool (context=64)…")
-    X, y = build_training_pool(train_pool)
-    print(f"    TF pool X={X.shape}  y.mean={y.mean():.3f}")
+    print(">>> Training spectral+metadata CW (v27)…")
+    t0 = time.time()
+    cw_v27 = build_spectral_hybrid(train_pool)
+    print(f"    cw v27 fit {time.time() - t0:.1f}s")
 
-    print(">>> Training 3-seed Transformer ensemble…")
-    tf_models = []
-    for s in CNN_SEEDS:
-        print(f">>> TF seed={s}")
-        t0 = time.time()
-        tf_models.append(fit_tf(X, y, s))
-        print(f"    fit {time.time() - t0:.1f}s  params={sum(p.numel() for p in tf_models[-1].parameters()):,}")
-
-    # Baseline: load CNN ensemble for the same v22 pipeline
-    from v22_metadata_features import scores_v14_with_meta as v22_scores_cnn
-    from v6_cnn import build_training_pool as v6_pool
-    from v7_cnn_ensemble import fit_cnn_with_seed
-    print(">>> Training 3-seed CNN ensemble for baseline comparison…")
+    print(">>> Training 3-seed CNN ensemble…")
     Xc, yc = v6_pool(train_pool)
     cnn_models = []
     for s in CNN_SEEDS:
@@ -235,51 +226,47 @@ def run_validation(seed: int = 42) -> dict:
         cnn_models.append(fit_cnn_with_seed(Xc, yc, s))
         print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
 
-    def pred_tf(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
-        scores = scores_with_tf(sub_tr_x, sub_tr_y, sub_te_x, cw, tf_models, info,
-                                info.get("metric_type", "ALL"))
-        return predict_segments(scores, int(round(len(sub_te_x) * ratio)), **SEG_KWARGS)
+    def pred(cw_obj):
+        def fn(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
+            scores = scores_with_meta(sub_tr_x, sub_tr_y, sub_te_x, cw_obj, cnn_models,
+                                      info, info.get("metric_type", "ALL"))
+            return predict_segments(scores, int(round(len(sub_te_x) * ratio)), **SEG_KWARGS)
+        return fn
 
-    def pred_cnn(sub_tr_x, sub_tr_y, sub_te_x, info, ratio):
-        scores = v22_scores_cnn(sub_tr_x, sub_tr_y, sub_te_x, cw, cnn_models, info,
-                                info.get("metric_type", "ALL"))
-        return predict_segments(scores, int(round(len(sub_te_x) * ratio)), **SEG_KWARGS)
+    print("\n>>> Eval v22 baseline…")
+    rep_v22 = evaluate(pred(cw_v22), holdout)
+    print_summary(rep_v22, name="v22 baseline")
 
-    print("\n>>> Eval CNN baseline (v22 architecture)…")
-    rep_cnn = evaluate(pred_cnn, holdout)
-    print_summary(rep_cnn, name="CNN baseline (v22)")
+    print(">>> Eval v27 (+ spectral features)…")
+    rep_v27 = evaluate(pred(cw_v27), holdout)
+    print_summary(rep_v27, name="v27 spectral+meta")
 
-    print(">>> Eval Transformer ensemble (v26)…")
-    rep_tf = evaluate(pred_tf, holdout)
-    print_summary(rep_tf, name="Transformer ensemble")
-
-    delta = rep_tf["overall_f1"] - rep_cnn["overall_f1"]
-    print(f"\n  Δ (TF − CNN) = {delta:+.4f}")
+    delta = rep_v27["overall_f1"] - rep_v22["overall_f1"]
+    print(f"\n  Δ (v27 − v22) = {delta:+.4f}")
 
     report = {
-        "cnn_f1": rep_cnn["overall_f1"],
-        "tf_f1": rep_tf["overall_f1"],
+        "v22_f1": rep_v22["overall_f1"],
+        "v27_f1": rep_v27["overall_f1"],
         "delta": delta,
         "seed": seed,
         "n_holdout": len(holdout),
     }
-    save_report(report, "v26_transformer")
-    return report, cw, tf_models
+    save_report(report, "v27_spectral_features")
+    return report, cw_v27, cnn_models
 
 
-def generate_submission(cw, tf_models, output: Path = Path("submission_transformer.json")) -> Path:
+def generate_submission(cw, cnn_models, output: Path = Path("submission_spectral.json")) -> Path:
     print(f"\n>>> Re-training on ALL 1000 windows…")
     t0 = time.time()
-    cw_full = build_metadata_hybrid(all_window_dirs(), mode="intervals")
+    cw_full = build_spectral_hybrid(all_window_dirs())
     print(f"    cw fit {time.time() - t0:.1f}s")
 
-    X, y = build_training_pool(all_window_dirs())
-    print(f"    TF pool X={X.shape}")
-    tf_full = []
+    Xc, yc = v6_pool(all_window_dirs())
+    cnn_full = []
     for s in CNN_SEEDS:
         t0 = time.time()
-        tf_full.append(fit_tf(X, y, s))
-        print(f"    tf seed={s} fit {time.time() - t0:.1f}s")
+        cnn_full.append(fit_cnn_with_seed(Xc, yc, s))
+        print(f"    cnn seed={s} fit {time.time() - t0:.1f}s")
 
     print(">>> Generating predictions…")
     preds: dict[str, list[int]] = {}
@@ -287,8 +274,8 @@ def generate_submission(cw, tf_models, output: Path = Path("submission_transform
     for i, wdir in enumerate(all_window_dirs(), 1):
         w = load_window(wdir)
         ratio = float(w.info.get("test set anomaly ratio", 0.0))
-        scores = scores_with_tf(w.train_x, w.train_y, w.test_x, cw_full, tf_full,
-                                w.info, w.metric_type)
+        scores = scores_with_meta(w.train_x, w.train_y, w.test_x, cw_full, cnn_full,
+                                  w.info, w.metric_type)
         k = int(round(len(w.test_x) * ratio))
         preds[w.wid] = predict_segments(scores, k, **SEG_KWARGS).astype(int).tolist()
         if i % 100 == 0:
@@ -304,10 +291,10 @@ def generate_submission(cw, tf_models, output: Path = Path("submission_transform
 
 
 if __name__ == "__main__":
-    rep, cw, tf_models = run_validation()
-    if rep["delta"] > 0.003:
-        print(f"\nTransformer beats CNN by {rep['delta']:+.4f}; generating submission.")
-        generate_submission(cw, tf_models)
+    rep, cw, cnn_models = run_validation()
+    if rep["delta"] > 0.001:
+        print(f"\nSpectral features beat v22 by {rep['delta']:+.4f}; generating submission.")
+        generate_submission(cw, cnn_models)
     else:
-        print(f"\nTransformer did not beat CNN (Δ = {rep['delta']:+.4f}); "
+        print(f"\nSpectral features did not help (Δ = {rep['delta']:+.4f}); "
               "submission NOT generated.")
